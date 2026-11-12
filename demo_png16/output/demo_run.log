@@ -1,0 +1,123 @@
+================================================================
+STAGE 1 - environment
+================================================================
+pwd    : /home/ys/feedback/uidreczz28YfqcCHoEV/demo_png16
+repo   : /home/ys/feedback/uidreczz28YfqcCHoEV
+output : /home/ys/feedback/uidreczz28YfqcCHoEV/demo_png16/output
+cc     : gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+python : Python 3.12.3 (../.venv-png16/bin/python)
+
+================================================================
+STAGE 2 - build
+================================================================
++ gcc -std=c11 -Wall -Wextra -O2 make_baseline_8bit.c -o output/make_baseline_8bit
+exit_code=0
++ gcc -std=c11 -Wall -Wextra -O2 png16_demo.c -o output/png16_demo -lm
+exit_code=0
+
+================================================================
+STAGE 3 - write cases (16-bit gray / RGB / RGBA / error cases + 8-bit)
+================================================================
++ ./output/make_baseline_8bit
+[baseline] output/baseline_8bit.png written via 8-bit stbi_write_png
+exit_code=0
++ ./output/png16_demo
+[case] name=gray16_gradient w=256 h=64 bitdepth=16 comp=1 path=output/gray16_gradient.png bytes=428 rc=0
+[case] name=rgb16 w=96 h=48 bitdepth=16 comp=3 path=output/rgb16.png bytes=493 rc=0
+[case] name=rgb16_strided w=96 h=48 bitdepth=16 comp=3 path=output/rgb16_strided.png bytes=493 rc=1 stride=578
+[case] name=rgba16 w=64 h=32 bitdepth=16 comp=4 path=output/rgba16.png bytes=494 rc=0
+[case] name=gray_alpha16 w=48 h=24 bitdepth=16 comp=2 path=output/gray_alpha16.png bytes=154 rc=0
+[case] name=err_zero_wh w=0 h=0 bitdepth=16 comp=1 path=output/err_zero_wh.png bytes=-1 rc=0 (expect 0)
+[case] name=err_short_buffer w=4 h=4 bitdepth=16 comp=1 path=output/err_short_buffer.png bytes=-1 rc=-1 shortfall=12 (expect rc=-1)
+[case] name=regression_8bit w=128 h=64 bitdepth=8 comp=3 path=output/regression_8bit.png bytes=642 rc=1
+[stbi_load_16] output/gray16_gradient.png -> w=256 h=64 comp=1 first=0 last=255
+[stbi_load_16] output/rgb16.png -> w=96 h=48 comp=3 first=0 last=256
+[stbi_load_16] output/rgba16.png -> w=64 h=32 comp=4 first=38399 last=4096
+[done] manifest=output/manifest.txt
+exit_code=0
+total 332
+-rw-r--r-- 1 ys ys    642 Nov 12 15:34 baseline_8bit.png
+-rw-r--r-- 1 ys ys   7509 Nov 12 15:33 demo_recording.cast
+-rw-r--r-- 1 ys ys   2182 Nov 12 15:34 demo_run.log
+-rw-r--r-- 1 ys ys    428 Nov 12 15:34 gray16_gradient.png
+-rw-r--r-- 1 ys ys  32768 Nov 12 15:34 gray16_gradient.raw
+-rw-r--r-- 1 ys ys    154 Nov 12 15:34 gray_alpha16.png
+-rw-r--r-- 1 ys ys   4608 Nov 12 15:34 gray_alpha16.raw
+-rwxr-xr-x 1 ys ys  49264 Nov 12 15:34 make_baseline_8bit
+-rw-r--r-- 1 ys ys    430 Nov 12 15:34 manifest.txt
+-rwxr-xr-x 1 ys ys 151872 Nov 12 15:34 png16_demo
+-rw-r--r-- 1 ys ys    642 Nov 12 15:34 regression_8bit.png
+-rw-r--r-- 1 ys ys    493 Nov 12 15:34 rgb16.png
+-rw-r--r-- 1 ys ys  27648 Nov 12 15:34 rgb16.raw
+-rw-r--r-- 1 ys ys    493 Nov 12 15:34 rgb16_strided.png
+-rw-r--r-- 1 ys ys    494 Nov 12 15:34 rgba16.png
+-rw-r--r-- 1 ys ys  16384 Nov 12 15:34 rgba16.raw
+
+================================================================
+STAGE 4 - read back with Python (pypng + Pillow)
+================================================================
++ ../.venv-png16/bin/python verify.py
+
+== verify gray16_gradient ==
+pypng      : width=256 height=64 bitdepth=16 color_type=0(grayscale) channels=1 row_bytes=512
+samples    : written_vs_readback (index: written -> readback)
+             [      0]     0 ->     0
+             [      1]     1 ->     1
+             [   8192]     0 ->     0
+             [  16382]   254 ->   254
+             [  16383]   255 ->   255
+max_error  : 0   mismatched_samples: 0 / 16384
+Pillow     : mode=I;16 size=(256, 64) extrema=(0, 255) (decoded OK)
+
+== verify rgb16 ==
+pypng      : width=96 height=48 bitdepth=16 color_type=2(RGB) channels=3 row_bytes=576
+samples    : written_vs_readback (index: written -> readback)
+             [      0]     0 ->     0
+             [      1]     0 ->     0
+             [   6912]     0 ->     0
+             [  13822] 65535 -> 65535
+             [  13823] 24462 -> 24462
+max_error  : 0   mismatched_samples: 0 / 13824
+Pillow     : mode=RGB size=(96, 48) extrema=((0, 255), (0, 255), (0, 95)) (decoded OK)
+
+== verify rgba16 ==
+pypng      : width=64 height=32 bitdepth=16 color_type=6(RGBA) channels=4 row_bytes=512
+samples    : written_vs_readback (index: written -> readback)
+             [      0]     0 ->     0
+             [      1] 65535 -> 65535
+             [   4096]     0 ->     0
+             [   8190]    32 ->    32
+             [   8191] 65535 -> 65535
+max_error  : 0   mismatched_samples: 0 / 8192
+Pillow     : mode=RGBA size=(64, 32) extrema=((0, 251), (7, 255), (0, 240), (0, 255)) (decoded OK)
+
+== verify gray_alpha16 ==
+pypng      : width=48 height=24 bitdepth=16 color_type=4(gray+alpha) channels=2 row_bytes=192
+samples    : written_vs_readback (index: written -> readback)
+             [      0]     0 ->     0
+             [      1] 32768 -> 32768
+             [   1152] 34192 -> 34192
+             [   2302] 65535 -> 65535
+             [   2303] 56268 -> 56268
+max_error  : 0   mismatched_samples: 0 / 2304
+Pillow     : mode=RGBA size=(48, 24) extrema=((0, 255), (0, 255), (0, 255), (128, 219)) (decoded OK)
+
+== error handling ==
+     err_zero_wh: rc=0 file_exists=False size=0
+err_short_buffer: rc=-1 file_exists=False size=0
+
+== 8-bit regression vs pre-change baseline ==
+baseline   : /home/ys/feedback/uidreczz28YfqcCHoEV/demo_png16/output/baseline_8bit.png 128x64 bitdepth=8 color_type=2 channels=3
+current    : /home/ys/feedback/uidreczz28YfqcCHoEV/demo_png16/output/regression_8bit.png 128x64 bitdepth=8 color_type=2 channels=3
+pixels     : total=24576 per-pixel byte diffs=0 (expect 0)   byte-identical files: True
+
+ALL CHECKS PASSED
+exit_code=0
+
+================================================================
+STAGE 5 - regression summary
+================================================================
+8-bit regression pixel diffs vs baseline: 0 (expected 0)
+exit_code=0
+
+ALL STAGES COMPLETE

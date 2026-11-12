@@ -1,0 +1,7 @@
+gray16_gradient|256|64|1|16|output/gray16_gradient.png|output/gray16_gradient.raw|0
+rgb16|96|48|3|16|output/rgb16.png|output/rgb16.raw|0
+rgba16|64|32|4|16|output/rgba16.png|output/rgba16.raw|0
+gray_alpha16|48|24|2|16|output/gray_alpha16.png|output/gray_alpha16.raw|0
+err_zero_wh|0|0|1|16|output/err_zero_wh.png||0
+err_short_buffer|4|4|1|16|output/err_short_buffer.png||-1
+regression_8bit|128|64|3|16|output/regression_8bit.png||1
