@@ -79,6 +79,17 @@ USAGE:
       int stbi_write_png_compression_level;    // defaults to 8; set to higher for more compression
       int stbi_write_force_png_filter;         // defaults to -1; set to 0..5 to force a filter mode
 
+   PNG can also embed an ICC color profile (written as an iCCP chunk
+   before IDAT). Call stbi_write_png_icc_profile() once to set it; it
+   applies to all subsequent PNG writes until cleared:
+
+      int stbi_write_png_icc_profile(const char *profile_name, const unsigned char *profile_data, int profile_len);
+
+   The profile data is zlib-compressed into the chunk. The profile name
+   must be 1..79 bytes (PNG spec limit); the function returns
+   STBIW_ICC_ERR_NAME_LENGTH if it isn't. Pass profile_data=NULL to
+   clear the profile and return to the default no-iCCP output.
+
 
    You can define STBI_WRITE_NO_STDIO to disable the file variant of these
    functions, so the library will not use stdio.h at all. However, this will
@@ -225,6 +236,13 @@ STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context
 
 STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
 
+// PNG only: set an ICC profile to embed as an iCCP chunk (see docs above).
+// profile_name must be 1..79 bytes; profile_data may be NULL to clear.
+#define STBIW_ICC_OK              0
+#define STBIW_ICC_ERR_NAME_LENGTH 1  // profile name empty or longer than 79 bytes
+#define STBIW_ICC_ERR_BAD_ARG     2  // NULL name or negative length with non-NULL data
+STBIWDEF int stbi_write_png_icc_profile(const char *profile_name, const unsigned char *profile_data, int profile_len);
+
 #endif//INCLUDE_STB_IMAGE_WRITE_H
 
 #ifdef STB_IMAGE_WRITE_IMPLEMENTATION
@@ -295,6 +313,32 @@ static int stbi__flip_vertically_on_write = 0;
 STBIWDEF void stbi_flip_vertically_on_write(int flag)
 {
    stbi__flip_vertically_on_write = flag;
+}
+
+#define STBIW_ICC_NAME_MAX 79  // per PNG spec, iCCP profile names are 1..79 bytes
+
+static char stbiw__icc_name[STBIW_ICC_NAME_MAX+1] = { 0 };
+static const unsigned char *stbiw__icc_data = NULL;
+static int stbiw__icc_len = 0;
+
+STBIWDEF int stbi_write_png_icc_profile(const char *profile_name, const unsigned char *profile_data, int profile_len)
+{
+   int name_len;
+   if (profile_data == NULL) { // clear: subsequent PNGs have no iCCP chunk
+      stbiw__icc_name[0] = 0;
+      stbiw__icc_data = NULL;
+      stbiw__icc_len = 0;
+      return STBIW_ICC_OK;
+   }
+   if (profile_name == NULL || profile_len < 0)
+      return STBIW_ICC_ERR_BAD_ARG;
+   name_len = (int) strlen(profile_name);
+   if (name_len < 1 || name_len > STBIW_ICC_NAME_MAX)
+      return STBIW_ICC_ERR_NAME_LENGTH;
+   STBIW_MEMMOVE(stbiw__icc_name, profile_name, name_len+1);
+   stbiw__icc_data = profile_data;
+   stbiw__icc_len = profile_len;
+   return STBIW_ICC_OK;
 }
 
 typedef struct
@@ -1160,7 +1204,9 @@ STBIWDEF unsigned char * stbi_zlib_compress(unsigned char *data, int data_len, i
    STBIW_FREE(hash_table);
 
    // store uncompressed instead if compression was worse
-   if (stbiw__sbn(out) > data_len + 2 + ((data_len+32766)/32767)*5) {
+   // (not for empty input: the stored-block loop below emits no block
+   // for data_len==0, which would produce an invalid zlib stream)
+   if (data_len > 0 && stbiw__sbn(out) > data_len + 2 + ((data_len+32766)/32767)*5) {
       stbiw__sbn(out) = 2;  // truncate to DEFLATE 32K window and FLEVEL = 1
       for (j = 0; j < data_len;) {
          int blocklen = data_len - j;
@@ -1310,7 +1356,8 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    unsigned char sig[8] = { 137,80,78,71,13,10,26,10 };
    unsigned char *out,*o, *filt, *zlib;
    signed char *line_buffer;
-   int j,zlen;
+   unsigned char *icc_zlib = NULL;
+   int j,zlen, icc_zlen=0, icc_name_len=0;
 
    if (!stbiw__validate_dimensions(x, y, n))
       return 0;
@@ -1361,10 +1408,16 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    STBIW_FREE(filt);
    if (!zlib) return 0;
 
+   if (stbiw__icc_data != NULL) {
+      icc_name_len = (int) strlen(stbiw__icc_name);
+      icc_zlib = stbi_zlib_compress((unsigned char *) stbiw__icc_data, stbiw__icc_len, &icc_zlen, stbi_write_png_compression_level);
+      if (!icc_zlib) { STBIW_FREE(zlib); return 0; }
+   }
+
    // each tag requires 12 bytes of overhead
-   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + 12+zlen + 12);
+   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + (icc_zlib ? 12 + icc_name_len+2+icc_zlen : 0) + 12+zlen + 12);
    if (!out) return 0;
-   *out_len = 8 + 12+13 + 12+zlen + 12;
+   *out_len = 8 + 12+13 + (icc_zlib ? 12 + icc_name_len+2+icc_zlen : 0) + 12+zlen + 12;
 
    o=out;
    STBIW_MEMMOVE(o,sig,8); o+= 8;
@@ -1378,6 +1431,20 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    *o++ = 0;
    *o++ = 0;
    stbiw__wpcrc(&o,13);
+
+   if (icc_zlib) {
+      // iCCP: profile name, null separator, compression method (0=zlib), compressed profile
+      stbiw__wp32(o, icc_name_len+2+icc_zlen);
+      stbiw__wptag(o, "iCCP");
+      STBIW_MEMMOVE(o, stbiw__icc_name, icc_name_len);
+      o += icc_name_len;
+      *o++ = 0;
+      *o++ = 0;
+      STBIW_MEMMOVE(o, icc_zlib, icc_zlen);
+      o += icc_zlen;
+      STBIW_FREE(icc_zlib);
+      stbiw__wpcrc(&o, icc_name_len+2+icc_zlen);
+   }
 
    stbiw__wp32(o, zlen);
    stbiw__wptag(o, "IDAT");
