@@ -1,0 +1,21 @@
+ 0  stb=                   fonttools=                   ok
+ 1  stb=                   fonttools=                   ok
+ 2  stb=                   fonttools=                   ok
+ 3  stb=                   fonttools=                   ok
+ 4  stb=                   fonttools=                   ok
+ 5  stb=                   fonttools=                   ok
+ 6  stb=                   fonttools=                   ok
+ 7  stb=                   fonttools=                   ok
+ 8  stb=                   fonttools=                   ok
+ 9  stb=                   fonttools=                   ok
+10  stb=                   fonttools=                   ok
+11  stb=                   fonttools=                   ok
+12  stb=                   fonttools=                   ok
+13  stb=                   fonttools=                   ok
+14  stb=                   fonttools=                   ok
+15  stb=                   fonttools=                   ok
+16  stb=                   fonttools=                   ok
+17  stb=                   fonttools=                   ok
+18  stb=                   fonttools=                   ok
+19  stb=                   fonttools=                   ok
+PASS

@@ -1,0 +1,21 @@
+ 0  stb=.notdef            fonttools=.notdef            ok
+ 1  stb=.null              fonttools=.null              ok
+ 2  stb=space              fonttools=space              ok
+ 3  stb=A                  fonttools=A                  ok
+ 4  stb=B                  fonttools=B                  ok
+ 5  stb=C                  fonttools=C                  ok
+ 6  stb=D                  fonttools=D                  ok
+ 7  stb=E                  fonttools=E                  ok
+ 8  stb=F                  fonttools=F                  ok
+ 9  stb=G                  fonttools=G                  ok
+10  stb=H                  fonttools=H                  ok
+11  stb=I                  fonttools=I                  ok
+12  stb=J                  fonttools=J                  ok
+13  stb=K                  fonttools=K                  ok
+14  stb=L                  fonttools=L                  ok
+15  stb=M                  fonttools=M                  ok
+16  stb=N                  fonttools=N                  ok
+17  stb=O                  fonttools=O                  ok
+18  stb=P                  fonttools=P                  ok
+19  stb=f_f                fonttools=f_f                ok
+PASS

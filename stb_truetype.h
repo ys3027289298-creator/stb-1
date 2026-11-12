@@ -1060,6 +1060,14 @@ STBTT_DEF const char *stbtt_GetFontNameString(const stbtt_fontinfo *font, int *l
 STBTT_DEF int stbtt_GetFontNameDefault(const stbtt_fontinfo *font, char *output_buffer, size_t output_buffer_len);
 // return the default english full name of the font as utf-8
 
+STBTT_DEF const char *stbtt_GetGlyphName(const stbtt_fontinfo *info, int glyph_index, char *name_buffer, int name_buffer_len);
+// returns the name of the glyph at glyph_index, parsed from the "post" table
+// (only post format 2.0 is supported). names that refer to the standard mac
+// glyph set are returned as pointers to static strings; custom names are
+// copied (nul-terminated, truncated if needed) into name_buffer, which must
+// be at least name_buffer_len bytes big. returns "" if the font has no post
+// table, if the post table is not format 2.0, or if glyph_index is invalid.
+
 enum { // platformID
    STBTT_PLATFORM_ID_UNICODE   =0,
    STBTT_PLATFORM_ID_MAC       =1,
@@ -2761,6 +2769,86 @@ STBTT_DEF int stbtt_GetFontUnderlineMetrics(const stbtt_fontinfo *info, int *pos
    *position = ttSHORT(info->data + tab + 8);
    *thickness = ttSHORT(info->data + tab + 10);
    return 1;
+}
+
+// the 258 standard macintosh glyph names, indexed by the values 0..257
+// stored in a format 2.0 "post" table (see the truetype spec, "post" table)
+static const char *stbtt__mac_glyph_names[258] = {
+   ".notdef",".null","nonmarkingreturn","space","exclam","quotedbl",
+   "numbersign","dollar","percent","ampersand","quotesingle","parenleft",
+   "parenright","asterisk","plus","comma","hyphen","period",
+   "slash","zero","one","two","three","four",
+   "five","six","seven","eight","nine","colon",
+   "semicolon","less","equal","greater","question","at",
+   "A","B","C","D","E","F",
+   "G","H","I","J","K","L",
+   "M","N","O","P","Q","R",
+   "S","T","U","V","W","X",
+   "Y","Z","bracketleft","backslash","bracketright","asciicircum",
+   "underscore","grave","a","b","c","d",
+   "e","f","g","h","i","j",
+   "k","l","m","n","o","p",
+   "q","r","s","t","u","v",
+   "w","x","y","z","braceleft","bar",
+   "braceright","asciitilde","Adieresis","Aring","Ccedilla","Eacute",
+   "Ntilde","Odieresis","Udieresis","aacute","agrave","acircumflex",
+   "adieresis","atilde","aring","ccedilla","eacute","egrave",
+   "ecircumflex","edieresis","iacute","igrave","icircumflex","idieresis",
+   "ntilde","oacute","ograve","ocircumflex","odieresis","otilde",
+   "uacute","ugrave","ucircumflex","udieresis","dagger","degree",
+   "cent","sterling","section","bullet","paragraph","germandbls",
+   "registered","copyright","trademark","acute","dieresis","notequal",
+   "AE","Oslash","infinity","plusminus","lessequal","greaterequal",
+   "yen","mu","partialdiff","summation","product","pi",
+   "integral","ordfeminine","ordmasculine","Omega","ae","oslash",
+   "questiondown","exclamdown","logicalnot","radical","florin","approxequal",
+   "Delta","guillemotleft","guillemotright","ellipsis","nonbreakingspace","Agrave",
+   "Atilde","Otilde","OE","oe","endash","emdash",
+   "quotedblleft","quotedblright","quoteleft","quoteright","divide","lozenge",
+   "ydieresis","Ydieresis","fraction","currency","guilsinglleft","guilsinglright",
+   "fi","fl","daggerdbl","periodcentered","quotesinglbase","quotedblbase",
+   "perthousand","Acircumflex","Ecircumflex","Aacute","Edieresis","Egrave",
+   "Iacute","Icircumflex","Idieresis","Igrave","Oacute","Ocircumflex",
+   "apple","Ograve","Uacute","Ucircumflex","Ugrave","dotlessi",
+   "circumflex","tilde","macron","breve","dotaccent","ring",
+   "cedilla","hungarumlaut","ogonek","caron","Lslash","lslash",
+   "Scaron","scaron","Zcaron","zcaron","brokenbar","Eth",
+   "eth","Yacute","yacute","Thorn","thorn","minus",
+   "multiply","onesuperior","twosuperior","threesuperior","onehalf","onequarter",
+   "threequarters","franc","Gbreve","gbreve","Idotaccent","Scedilla",
+   "scedilla","Cacute","cacute","Ccaron","ccaron","dcroat",
+};
+
+STBTT_DEF const char *stbtt_GetGlyphName(const stbtt_fontinfo *info, int glyph_index, char *name_buffer, int name_buffer_len)
+{
+   int post, num, idx, i, p, len;
+   if (name_buffer_len > 0)
+      name_buffer[0] = 0;
+   if (glyph_index < 0)
+      return "";
+   post = stbtt__find_table(info->data, info->fontstart, "post");
+   if (!post)
+      return ""; // no post table
+   if (ttULONG(info->data + post) != 0x00020000)
+      return ""; // only post format 2.0 carries glyph names
+   num = ttUSHORT(info->data + post + 32);
+   if (glyph_index >= num)
+      return "";
+   idx = ttUSHORT(info->data + post + 34 + 2*glyph_index);
+   if (idx < 258)
+      return stbtt__mac_glyph_names[idx];
+   // custom name: skip the pascal strings of the preceding custom names
+   p = post + 34 + 2*num;
+   for (i = 258; i < idx; ++i)
+      p += 1 + info->data[p];
+   len = info->data[p];
+   if (name_buffer_len > 0) {
+      if (len > name_buffer_len-1)
+         len = name_buffer_len-1;
+      STBTT_memcpy(name_buffer, info->data + p + 1, len);
+      name_buffer[len] = 0;
+   }
+   return name_buffer;
 }
 
 STBTT_DEF float stbtt_ScaleForPixelHeight(const stbtt_fontinfo *info, float height)
