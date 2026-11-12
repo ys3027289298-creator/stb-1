@@ -1,4 +1,4 @@
-/* stb_image_write - v1.17 - public domain - http://nothings.org/stb
+/* stb_image_write - v1.18 - public domain - http://nothings.org/stb
    writes out PNG/BMP/TGA/JPEG/HDR images to C stdio - Sean Barrett 2010-2015
                                      no warranty implied; use at your own risk
 
@@ -73,6 +73,21 @@ USAGE:
       void stbi_write_func(void *context, void *data, int size);
 
    There are also four more "_strided" functions for these as well.
+
+   For paletted (indexed-color) PNGs, where every pixel is an 8-bit index
+   into a palette of at most 256 colors:
+
+     int stbi_write_png_indexed(char const *filename, int w, int h, int palette_comp,
+                                const unsigned char *palette, int palette_len,
+                                const unsigned char *indices, ptrdiff_t stride_in_bytes);
+     int stbi_write_png_indexed_to_func(stbi_write_func *func, void *context, int w, int h, int palette_comp,
+                                const unsigned char *palette, int palette_len,
+                                const unsigned char *indices, ptrdiff_t stride_in_bytes);
+
+   'palette_comp' is 3 (RGB) or 4 (RGBA); an RGBA palette with any entry
+   below full opacity writes a tRNS chunk, a fully opaque one does not.
+   Every value in 'indices' must be smaller than 'palette_len', otherwise
+   the call fails (returns 0) and no file or callback output is produced.
 
    You can configure it with these global variables:
       int stbi_write_tga_with_rle;             // defaults to true; set to 0 to disable RLE
@@ -195,6 +210,7 @@ STBIWDEF int stbi_write_force_png_filter;
 
 #ifndef STBI_WRITE_NO_STDIO
 STBIWDEF int stbi_write_png(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+STBIWDEF int stbi_write_png_indexed(char const *filename, int w, int h, int palette_comp, const unsigned char *palette, int palette_len, const unsigned char *indices, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_bmp(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_tga(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
@@ -213,6 +229,7 @@ STBIWDEF int stbiw_convert_wchar_to_utf8(char *buffer, size_t bufferlen, const w
 typedef void stbi_write_func(void *context, void *data, int size);
 
 STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+STBIWDEF int stbi_write_png_indexed_to_func(stbi_write_func *func, void *context, int w, int h, int palette_comp, const unsigned char *palette, int palette_len, const unsigned char *indices, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_bmp_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_tga_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data);
@@ -1422,6 +1439,156 @@ STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int x,
    return 1;
 }
 
+STBIWDEF unsigned char *stbi_write_png_indexed_to_mem(const unsigned char *indices, ptrdiff_t stride_bytes, int x, int y,
+                                                      int palette_comp, const unsigned char *palette, int palette_len,
+                                                      int *out_len)
+{
+   int force_filter = stbi_write_force_png_filter;
+   unsigned char sig[8] = { 137,80,78,71,13,10,26,10 };
+   unsigned char *out, *o, *filt, *zlib;
+   signed char *line_buffer;
+   int j, zlen, trns_len = 0, total;
+
+   // validate everything before touching the output so a failure can never
+   // leave behind a partial file or invoke the write callback at all.
+   if (!stbiw__validate_dimensions(x, y, 1) || palette == NULL || indices == NULL || out_len == NULL)
+      return 0;
+   if (palette_comp != 3 && palette_comp != 4)
+      return 0;
+   if (palette_len <= 0 || palette_len > 256)
+      return 0;
+
+   if (stride_bytes == 0)
+      stride_bytes = x;
+
+   if (!stbiw__mul2sizes_valid(palette_len, palette_comp)) return 0;
+   if (!stbiw__mad2sizes_valid(x, 1, 1)) return 0;
+   if (!stbiw__mul2sizes_valid(x + 1, y)) return 0;
+   for (j = 0; j < x * y; ++j) {
+      if ((int) indices[(ptrdiff_t) (j / x) * stride_bytes + (j % x)] >= palette_len)
+         return 0;
+   }
+   if (palette_comp == 4) {
+      for (j = 0; j < palette_len; ++j) {
+         if (palette[j * 4 + 3] != 255)
+            trns_len = j + 1;
+      }
+   }
+
+   if (force_filter >= 5)
+      force_filter = -1;
+
+   filt = (unsigned char *) STBIW_MALLOC((size_t) (x + 1) * y); if (!filt) return 0;
+   line_buffer = (signed char *) STBIW_MALLOC(x); if (!line_buffer) { STBIW_FREE(filt); return 0; }
+   for (j = 0; j < y; ++j) {
+      int filter_type;
+      if (force_filter > -1) {
+         filter_type = force_filter;
+         stbiw__encode_png_line((unsigned char *) indices, stride_bytes, x, y, j, 1, force_filter, line_buffer);
+      } else { // Estimate the best filter by running through all of them:
+         int best_filter = 0, best_filter_val = 0x7fffffff, est, i;
+         for (filter_type = 0; filter_type < 5; filter_type++) {
+            stbiw__encode_png_line((unsigned char *) indices, stride_bytes, x, y, j, 1, filter_type, line_buffer);
+            est = 0;
+            for (i = 0; i < x; ++i)
+               est += abs(line_buffer[i]);
+            if (est < best_filter_val) {
+               best_filter_val = est;
+               best_filter = filter_type;
+            }
+         }
+         if (filter_type != best_filter) {
+            stbiw__encode_png_line((unsigned char *) indices, stride_bytes, x, y, j, 1, best_filter, line_buffer);
+            filter_type = best_filter;
+         }
+      }
+      filt[j * (x + 1)] = (unsigned char) filter_type;
+      STBIW_MEMMOVE(filt + j * (x + 1) + 1, line_buffer, x);
+   }
+   STBIW_FREE(line_buffer);
+   zlib = stbi_zlib_compress(filt, y * (x + 1), &zlen, stbi_write_png_compression_level);
+   STBIW_FREE(filt);
+   if (!zlib) return 0;
+
+   // signature + IHDR + PLTE + (optional tRNS) + IDAT + IEND; each chunk has 12 bytes overhead
+   total = 8 + (12 + 13) + (12 + palette_len * 3) + (trns_len ? 12 + trns_len : 0) + (12 + zlen) + 12;
+   out = (unsigned char *) STBIW_MALLOC(total);
+   if (!out) { STBIW_FREE(zlib); return 0; }
+   *out_len = total;
+
+   o = out;
+   STBIW_MEMMOVE(o, sig, 8); o += 8;
+   stbiw__wp32(o, 13);
+   stbiw__wptag(o, "IHDR");
+   stbiw__wp32(o, x);
+   stbiw__wp32(o, y);
+   *o++ = 8;                  // bit depth
+   *o++ = 3;                  // color type: indexed
+   *o++ = 0;
+   *o++ = 0;
+   *o++ = 0;
+   stbiw__wpcrc(&o, 13);
+
+   stbiw__wp32(o, palette_len * 3);
+   stbiw__wptag(o, "PLTE");
+   for (j = 0; j < palette_len; ++j) {
+      *o++ = palette[j * palette_comp + 0];
+      *o++ = palette[j * palette_comp + 1];
+      *o++ = palette[j * palette_comp + 2];
+   }
+   stbiw__wpcrc(&o, palette_len * 3);
+
+   if (trns_len) {
+      stbiw__wp32(o, trns_len);
+      stbiw__wptag(o, "tRNS");
+      for (j = 0; j < trns_len; ++j)
+         *o++ = palette[j * 4 + 3];
+      stbiw__wpcrc(&o, trns_len);
+   }
+
+   stbiw__wp32(o, zlen);
+   stbiw__wptag(o, "IDAT");
+   STBIW_MEMMOVE(o, zlib, zlen);
+   o += zlen;
+   STBIW_FREE(zlib);
+   stbiw__wpcrc(&o, zlen);
+
+   stbiw__wp32(o, 0);
+   stbiw__wptag(o, "IEND");
+   stbiw__wpcrc(&o, 0);
+
+   STBIW_ASSERT(o == out + *out_len);
+
+   return out;
+}
+
+#ifndef STBI_WRITE_NO_STDIO
+STBIWDEF int stbi_write_png_indexed(char const *filename, int x, int y, int palette_comp, const unsigned char *palette, int palette_len, const unsigned char *indices, ptrdiff_t stride_bytes)
+{
+   FILE *f;
+   int len;
+   unsigned char *png = stbi_write_png_indexed_to_mem(indices, stride_bytes, x, y, palette_comp, palette, palette_len, &len);
+   if (png == NULL) return 0;
+
+   f = stbiw__fopen(filename, "wb");
+   if (!f) { STBIW_FREE(png); return 0; }
+   fwrite(png, 1, len, f);
+   fclose(f);
+   STBIW_FREE(png);
+   return 1;
+}
+#endif
+
+STBIWDEF int stbi_write_png_indexed_to_func(stbi_write_func *func, void *context, int x, int y, int palette_comp, const unsigned char *palette, int palette_len, const unsigned char *indices, ptrdiff_t stride_bytes)
+{
+   int len;
+   unsigned char *png = stbi_write_png_indexed_to_mem(indices, stride_bytes, x, y, palette_comp, palette, palette_len, &len);
+   if (png == NULL) return 0;
+   func(context, png, len);
+   STBIW_FREE(png);
+   return 1;
+}
+
 
 /* ***************************************************************************
  *
@@ -1827,6 +1994,8 @@ STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const 
 #endif // STB_IMAGE_WRITE_IMPLEMENTATION
 
 /* Revision history
+      1.18
+             add stbi_write_png_indexed() for paletted (color type 3) PNGs with PLTE and optional tRNS chunks
       1.16  (2021-07-11)
              make Deflate code emit uncompressed blocks when it would otherwise expand
              support writing BMPs with alpha channel
