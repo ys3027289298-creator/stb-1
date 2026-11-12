@@ -50,6 +50,11 @@ USAGE:
      int stbi_write_jpg(char const *filename, int w, int h, int comp, const void *data, int quality);
      int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
 
+     PNM writers (8-bit PGM/PPM, 16-bit big-endian PGM/PPM, and optional 1-bit PBM):
+     int stbi_write_pnm(char const *filename, int w, int h, int comp, const void *data);
+     int stbi_write_pnm16(char const *filename, int w, int h, int comp, const unsigned short *data);
+     int stbi_write_pbm(char const *filename, int w, int h, int comp, const void *data);
+
      void stbi_flip_vertically_on_write(int flag); // flag is non-zero to flip data vertically
 
    In addition there are four more functions which accept the "ptrdiff_t stride_in_bytes" argument, new functions for
@@ -204,6 +209,9 @@ STBIWDEF int stbi_write_bmp_strided(char const *filename, int w, int h, int comp
 STBIWDEF int stbi_write_tga_strided(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_hdr_strided(char const *filename, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_jpg_strided(char const *filename, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
+STBIWDEF int stbi_write_pnm(char const *filename, int w, int h, int comp, const void *data);
+STBIWDEF int stbi_write_pnm16(char const *filename, int w, int h, int comp, const unsigned short *data);
+STBIWDEF int stbi_write_pbm(char const *filename, int w, int h, int comp, const void *data);
 
 #ifdef STBIW_WINDOWS_UTF8
 STBIWDEF int stbiw_convert_wchar_to_utf8(char *buffer, size_t bufferlen, const wchar_t* input);
@@ -222,6 +230,9 @@ STBIWDEF int stbi_write_bmp_strided_to_func(stbi_write_func *func, void *context
 STBIWDEF int stbi_write_tga_strided_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_hdr_strided_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
+STBIWDEF int stbi_write_pnm_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data);
+STBIWDEF int stbi_write_pnm16_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const unsigned short *data);
+STBIWDEF int stbi_write_pbm_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data);
 
 STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
 
@@ -378,7 +389,7 @@ static int stbi__start_write_file(stbi__write_context *s, const char *filename)
 
 static int stbi__end_write_file(stbi__write_context *s, int result)
 {
-   if (fclose((FILE *)s->context) != 0)
+   if (fclose((FILE *)s->file_maybe) != 0)
        s->ok = 0;
    return s->ok ? result : 0;
 }
@@ -971,6 +982,150 @@ STBIWDEF int stbi_write_hdr_strided(char const *filename, int x, int y, int comp
 STBIWDEF int stbi_write_hdr(char const *filename, int x, int y, int comp, const float *data)
 {
    return stbi_write_hdr_strided(filename, x, y, comp, data, 0);
+}
+#endif // STBI_WRITE_NO_STDIO
+
+
+// *************************************************************************************************
+// Netpbm PNM writer: binary PGM (P5), PPM (P6) and PBM (P4)
+// spec: http://netpbm.sourceforge.net/doc/#formats
+
+// append a decimal integer; avoids sprintf so this works with STBI_WRITE_NO_STDIO.
+static int stbiw__pnm_itoa(char *out, int v)
+{
+   char tmp[16];
+   int n = 0, i;
+   do { tmp[n++] = (char) ('0' + (v % 10)); v /= 10; } while (v);
+   for (i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+   return n;
+}
+
+// write the ASCII PNM header; comments follow the spec's "#" line convention.
+static void stbiw__pnm_header(stbi__write_context *s, char magic, int x, int y, int maxval)
+{
+   char hdr[64];
+   int n = 0;
+   hdr[n++] = 'P'; hdr[n++] = magic; hdr[n++] = '\n';
+   memcpy(hdr + n, "# stb_image_write PNM\n", sizeof("# stb_image_write PNM\n") - 1);
+   n += (int) sizeof("# stb_image_write PNM\n") - 1;
+   hdr[n++] = ' '; n += stbiw__pnm_itoa(hdr + n, x);
+   hdr[n++] = ' '; n += stbiw__pnm_itoa(hdr + n, y);
+   hdr[n++] = '\n';
+   if (maxval > 0) {
+      hdr[n++] = ' '; n += stbiw__pnm_itoa(hdr + n, maxval);
+      hdr[n++] = '\n';
+   }
+   s->func(s->context, hdr, (size_t) n);
+}
+
+// is16: 8-bit unsigned char pixels vs 16-bit unsigned short (big-endian on disk)
+// isbm: 1-bit PBM packed MSB-first; no maxval, pixel != 0 means white
+static int stbi_write_pnm_core(stbi__write_context *s, int x, int y, int comp, const void *data, int is16, int isbm)
+{
+   int is_rgb, j, jend, jdir, stride;
+   if (!data || !stbiw__validate_dimensions(x, y, comp)) return 0;
+   is_rgb = comp >= 3;
+   stride = x * comp * (is16 ? 2 : 1);
+   if (isbm) {
+      stbiw__pnm_header(s, '4', x, y, 0);
+      if (stbi__flip_vertically_on_write) { j = 0; jend = y; jdir = 1; }
+      else { j = y - 1; jend = -1; jdir = -1; }
+      for (; j != jend; j += jdir) {
+         const unsigned char *row = (const unsigned char *) data + j * stride;
+         int i;
+         for (i = 0; i < x; i += 8) {
+            unsigned char bits = 0;
+            int k;
+            for (k = 0; k < 8 && i + k < x; k++)
+               if (!row[(i + k) * comp]) bits |= (unsigned char)(0x80 >> k);
+            stbiw__write1(s, bits);
+         }
+      }
+      stbiw__write_flush(s);
+      return s->ok;
+   }
+   stbiw__pnm_header(s, is_rgb ? '6' : '5', x, y, is16 ? 65535 : 255);
+   if (stbi__flip_vertically_on_write) { j = 0; jend = y; jdir = 1; }
+   else { j = y - 1; jend = -1; jdir = -1; }
+   for (; j != jend; j += jdir) {
+      int i;
+      for (i = 0; i < x; i++) {
+         if (is16) {
+            const unsigned short *px = (const unsigned short *)
+               ((const unsigned char *) data + j * stride) + i * comp;
+            int c;
+            for (c = 0; c < (is_rgb ? 3 : 1); c++) {
+               unsigned short v = px[c];
+               stbiw__write1(s, STBIW_UCHAR(v >> 8));
+               stbiw__write1(s, STBIW_UCHAR(v));
+            }
+         } else {
+            const unsigned char *px = (const unsigned char *) data + j * stride + i * comp;
+            if (is_rgb) { stbiw__write1(s, px[0]); stbiw__write1(s, px[1]); stbiw__write1(s, px[2]); }
+            else stbiw__write1(s, px[0]);
+         }
+      }
+   }
+   stbiw__write_flush(s);
+   return s->ok;
+}
+
+STBIWDEF int stbi_write_pnm_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   stbi__start_write_callbacks(&s, func, context);
+   return stbi_write_pnm_core(&s, w, h, comp, data, 0, 0);
+}
+
+STBIWDEF int stbi_write_pnm16_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const unsigned short *data)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   stbi__start_write_callbacks(&s, func, context);
+   return stbi_write_pnm_core(&s, w, h, comp, data, 1, 0);
+}
+
+STBIWDEF int stbi_write_pbm_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   stbi__start_write_callbacks(&s, func, context);
+   return stbi_write_pnm_core(&s, w, h, comp, data, 0, 1);
+}
+
+#ifndef STBI_WRITE_NO_STDIO
+STBIWDEF int stbi_write_pnm(char const *filename, int w, int h, int comp, const void *data)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   if (stbi__start_write_file(&s, filename)) {
+      int r = stbi_write_pnm_core(&s, w, h, comp, data, 0, 0);
+      return stbi__end_write_file(&s, r);
+   }
+   return 0;
+}
+
+STBIWDEF int stbi_write_pnm16(char const *filename, int w, int h, int comp, const unsigned short *data)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   if (stbi__start_write_file(&s, filename)) {
+      int r = stbi_write_pnm_core(&s, w, h, comp, data, 1, 0);
+      return stbi__end_write_file(&s, r);
+   }
+   return 0;
+}
+
+STBIWDEF int stbi_write_pbm(char const *filename, int w, int h, int comp, const void *data)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   if (stbi__start_write_file(&s, filename)) {
+      int r = stbi_write_pnm_core(&s, w, h, comp, data, 0, 1);
+      return stbi__end_write_file(&s, r);
+   }
+   return 0;
 }
 #endif // STBI_WRITE_NO_STDIO
 

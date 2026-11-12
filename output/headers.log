@@ -1,0 +1,25 @@
+--- g8.pgm header ---
+P5
+# stb_image_write PNM
+ 4 3
+ 255
+
+--- g16.pgm header ---
+P5
+# stb_image_write PNM
+ 4 3
+ 65535
+
+--- rgb.ppm header ---
+P6
+# stb_image_write PNM
+ 4 3
+ 255
+
+--- bw.pbm header ---
+P4
+# stb_image_write PNM
+ 4 3
+..P
+g16 first 4 data bytes (expect 7d 00 8c a0, big-endian):
+ 7d 00 8c a0

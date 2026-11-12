@@ -1,0 +1,10 @@
+== case1: 8-bit PGM P5 ==
+output/g8.pgm w=4 h=3 depth=8 comp=1 sample[0]=160 sample[last]=60
+== case2: 16-bit PGM P5 (big-endian) ==
+output/g16.pgm w=4 h=3 depth=16 comp=1 sample[0]=32000 sample[1]=36000
+== case3: RGB PPM P6 ==
+output/rgb.ppm w=4 h=3 depth=8 comp=3 sample[0]=173 sample[last]=74
+== case4: bad parameters (expect all zero) ==
+bad comp=0 bad dims=0 null=0
+== optional: PBM P4 header check ==
+bw.pbm written, header: 
