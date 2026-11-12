@@ -79,6 +79,14 @@ USAGE:
       int stbi_write_png_compression_level;    // defaults to 8; set to higher for more compression
       int stbi_write_force_png_filter;         // defaults to -1; set to 0..5 to force a filter mode
 
+   PNG physical pixel size (pHYs chunk):
+      stbi_write_png_phys() and stbi_write_png_phys_to_func() additionally take
+      pixels_per_meter_x / pixels_per_meter_y. The unit is pixels per meter, NOT
+      DPI: convert with pixels_per_meter = dpi / 0.0254 (e.g. 96 DPI -> 3780,
+      300 DPI -> 11811). Passing 0 for either axis copies the other axis; passing
+      0 for both omits the pHYs chunk, in which case the output is byte-identical
+      to stbi_write_png().
+
 
    You can define STBI_WRITE_NO_STDIO to disable the file variant of these
    functions, so the library will not use stdio.h at all. However, this will
@@ -195,6 +203,7 @@ STBIWDEF int stbi_write_force_png_filter;
 
 #ifndef STBI_WRITE_NO_STDIO
 STBIWDEF int stbi_write_png(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+STBIWDEF int stbi_write_png_phys(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes, int pixels_per_meter_x, int pixels_per_meter_y);
 STBIWDEF int stbi_write_bmp(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_tga(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
@@ -213,6 +222,7 @@ STBIWDEF int stbiw_convert_wchar_to_utf8(char *buffer, size_t bufferlen, const w
 typedef void stbi_write_func(void *context, void *data, int size);
 
 STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+STBIWDEF int stbi_write_png_phys_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes, int pixels_per_meter_x, int pixels_per_meter_y);
 STBIWDEF int stbi_write_bmp_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_tga_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data);
@@ -1303,14 +1313,19 @@ static void stbiw__encode_png_line(unsigned char *pixels, ptrdiff_t stride_bytes
    }
 }
 
-STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdiff_t stride_bytes, int x, int y, int n, int *out_len)
+STBIWDEF unsigned char *stbi_write_png_to_mem_phys(const unsigned char *pixels, ptrdiff_t stride_bytes, int x, int y, int n, int *out_len, int pixels_per_meter_x, int pixels_per_meter_y)
 {
    int force_filter = stbi_write_force_png_filter;
    int ctype[5] = { -1, 0, 4, 2, 6 };
    unsigned char sig[8] = { 137,80,78,71,13,10,26,10 };
    unsigned char *out,*o, *filt, *zlib;
    signed char *line_buffer;
-   int j,zlen;
+   int j,zlen, has_phys;
+
+   if (pixels_per_meter_x < 0 || pixels_per_meter_y < 0) return 0;
+   if (pixels_per_meter_x == 0) pixels_per_meter_x = pixels_per_meter_y;
+   if (pixels_per_meter_y == 0) pixels_per_meter_y = pixels_per_meter_x;
+   has_phys = (pixels_per_meter_x != 0);
 
    if (!stbiw__validate_dimensions(x, y, n))
       return 0;
@@ -1361,10 +1376,10 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    STBIW_FREE(filt);
    if (!zlib) return 0;
 
-   // each tag requires 12 bytes of overhead
-   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + 12+zlen + 12);
+   // each tag requires 12 bytes of overhead; a pHYs chunk adds 12+9 bytes
+   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + (has_phys ? 12+9 : 0) + 12+zlen + 12);
    if (!out) return 0;
-   *out_len = 8 + 12+13 + 12+zlen + 12;
+   *out_len = 8 + 12+13 + (has_phys ? 12+9 : 0) + 12+zlen + 12;
 
    o=out;
    STBIW_MEMMOVE(o,sig,8); o+= 8;
@@ -1378,6 +1393,15 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    *o++ = 0;
    *o++ = 0;
    stbiw__wpcrc(&o,13);
+
+   if (has_phys) {
+      stbiw__wp32(o, 9);
+      stbiw__wptag(o, "pHYs");
+      stbiw__wp32(o, pixels_per_meter_x);
+      stbiw__wp32(o, pixels_per_meter_y);
+      *o++ = 1; // unit specifier: 1 = meter
+      stbiw__wpcrc(&o,9);
+   }
 
    stbiw__wp32(o, zlen);
    stbiw__wptag(o, "IDAT");
@@ -1395,6 +1419,11 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    return out;
 }
 
+STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdiff_t stride_bytes, int x, int y, int n, int *out_len)
+{
+   return stbi_write_png_to_mem_phys(pixels, stride_bytes, x, y, n, out_len, 0, 0);
+}
+
 #ifndef STBI_WRITE_NO_STDIO
 STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes)
 {
@@ -1410,12 +1439,37 @@ STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const 
    STBIW_FREE(png);
    return 1;
 }
+
+STBIWDEF int stbi_write_png_phys(char const *filename, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes, int pixels_per_meter_x, int pixels_per_meter_y)
+{
+   FILE *f;
+   int len;
+   unsigned char *png = stbi_write_png_to_mem_phys((const unsigned char *) data, stride_bytes, x, y, comp, &len, pixels_per_meter_x, pixels_per_meter_y);
+   if (png == NULL) return 0;
+
+   f = stbiw__fopen(filename, "wb");
+   if (!f) { STBIW_FREE(png); return 0; }
+   fwrite(png, 1, len, f);
+   fclose(f);
+   STBIW_FREE(png);
+   return 1;
+}
 #endif
 
 STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes)
 {
    int len;
    unsigned char *png = stbi_write_png_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len);
+   if (png == NULL) return 0;
+   func(context, png, len);
+   STBIW_FREE(png);
+   return 1;
+}
+
+STBIWDEF int stbi_write_png_phys_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes, int pixels_per_meter_x, int pixels_per_meter_y)
+{
+   int len;
+   unsigned char *png = stbi_write_png_to_mem_phys((const unsigned char *) data, stride_bytes, x, y, comp, &len, pixels_per_meter_x, pixels_per_meter_y);
    if (png == NULL) return 0;
    func(context, png, len);
    STBIW_FREE(png);
