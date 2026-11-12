@@ -1,0 +1,45 @@
+
+==== 1/8 build base.jpg via stb_image_write (in-memory callback) ====
+wrote tests/exif/base.jpg 8x12
+
+==== 2/8 inject EXIF orientations 1,3,6,8 plus a corrupt segment ====
+injected EXIF orientations 1/3/6/8 plus a corrupt segment into /home/ys/feedback/uidreczz28YlnC6LYHt/tests/exif
+
+==== 3/8 build reader demo against the modified stb_image.h ====
+
+==== 4/8 four required cases, switch OFF then ON ====
+CASE orient_1 (orientation tag = 1)
+  switch=OFF topleft=(199,37,48) size=8x12
+  switch=ON  topleft=(199,37,48) size=8x12
+CASE orient_3 (orientation tag = 3)
+  switch=OFF topleft=(199,37,48) size=8x12
+  switch=ON  topleft=(193,203,44) size=8x12
+CASE orient_6 (orientation tag = 6)
+  switch=OFF topleft=(199,37,48) size=8x12
+  switch=ON  topleft=(41,38,207) size=12x8
+CASE orient_8 (orientation tag = 8)
+  switch=OFF topleft=(199,37,48) size=8x12
+  switch=ON  topleft=(148,71,25) size=12x8
+
+==== 5/8 corrupt and missing EXIF must fall back to orientation 1 ====
+CASE corrupt_exif (orientation tag = 1)
+  switch=OFF topleft=(199,37,48) size=8x12
+  switch=ON  topleft=(199,37,48) size=8x12
+CASE no_exif (orientation tag = 1)
+  switch=OFF topleft=(199,37,48) size=8x12
+  switch=ON  topleft=(199,37,48) size=8x12
+
+==== 6/8 pixel and geometry assertions ====
+orient_1  PASS
+orient_3  PASS
+orient_6  PASS
+orient_8  PASS
+corrupt_exif PASS
+no_exif   PASS
+
+==== 7/8 switch OFF leaves stored pixels untouched (orient_6) ====
+  switch=OFF topleft=(199,37,48) size=8x12
+
+==== 8/8 summary ====
+ALL CHECKS PASSED
+report written to output/exif_report.txt

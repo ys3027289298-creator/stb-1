@@ -578,6 +578,14 @@ STBIDEF void stbi_convert_iphone_png_to_rgb(int flag_true_if_should_convert);
 // flip the image vertically, so the first pixel in the output array is the bottom left
 STBIDEF void stbi_set_flip_vertically_on_load(int flag_true_if_should_flip);
 
+// apply the EXIF orientation (JPEG APP1 tag 0x0112, values 1-8) so phone
+// photos come out upright; off (the default) loads pixels exactly as stored
+STBIDEF void stbi_set_apply_exif_orientation(int flag_true_if_should_apply);
+
+// return the EXIF orientation (1-8) stored in a JPEG; non-JPEG, missing or
+// corrupt EXIF all report 1. never fails.
+STBIDEF int  stbi_get_exif_orientation(char const *filename);
+
 // as above, but only applies to images loaded on the thread that calls the function
 // this function is only available if your compiler supports thread-local variables;
 // calling it will fail to link if your compiler doesn't
@@ -1178,6 +1186,13 @@ static int stbi__vertically_flip_on_load_global = 0;
 STBIDEF void stbi_set_flip_vertically_on_load(int flag_true_if_should_flip)
 {
    stbi__vertically_flip_on_load_global = flag_true_if_should_flip;
+}
+
+static int stbi__apply_exif_orientation_global = 0;
+
+STBIDEF void stbi_set_apply_exif_orientation(int flag_true_if_should_apply)
+{
+   stbi__apply_exif_orientation_global = flag_true_if_should_apply;
 }
 
 #ifndef STBI_THREAD_LOCAL
@@ -2053,6 +2068,7 @@ typedef struct
    int            jfif;
    int            app14_color_transform; // Adobe APP14 tag
    int            rgb;
+   int            orientation;           // EXIF Orientation tag (0x0112), 0/1 means unchanged
 
    int scan_n, order[4];
    int restart_interval, todo;
@@ -3162,6 +3178,104 @@ static void stbi__jpeg_finish(stbi__jpeg *z)
    }
 }
 
+// parse an EXIF APP1 segment and store the Orientation tag (0x0112).
+// seg_len is the segment payload size after the 2-byte length field.
+// any malformed/missing data is ignored and treated as orientation 1.
+// returns the number of payload bytes consumed from the stream.
+typedef struct
+{
+   stbi__context *s;
+   int consumed;
+} stbi__exif_reader;
+
+static stbi_uc stbi__exif_r8(stbi__exif_reader *r)
+{
+   r->consumed++;
+   return stbi__get8(r->s);
+}
+
+static unsigned int stbi__exif_r16(stbi__exif_reader *r, int big_endian)
+{
+   unsigned int hi = stbi__exif_r8(r), lo = stbi__exif_r8(r);
+   return big_endian ? (hi << 8) | lo : hi | (lo << 8);
+}
+
+static stbi__uint32 stbi__exif_r32(stbi__exif_reader *r, int big_endian)
+{
+   unsigned int hi = stbi__exif_r16(r, big_endian), lo = stbi__exif_r16(r, big_endian);
+   return big_endian ? ((stbi__uint32) hi << 16) | lo
+                     : (stbi__uint32) hi | ((stbi__uint32) lo << 16);
+}
+
+static int stbi__process_exif_app1(stbi__jpeg *z, int seg_len)
+{
+   static const unsigned char exif_tag[6] = {'E','x','i','f',0,0};
+   stbi__exif_reader r;
+   stbi__context *s = z->s;
+   int big_endian, i, count, remaining;
+   stbi__uint32 ifd_off;
+   stbi_uc byte;
+   r.s = s;
+   r.consumed = 0;
+
+   if (seg_len < 14) return r.consumed; // 6 "Exif\0\0" + 8 TIFF header
+   for (i = 0; i < 6; ++i)
+      if (stbi__exif_r8(&r) != exif_tag[i]) return r.consumed;
+
+   {
+      stbi_uc bo0 = stbi__exif_r8(&r), bo1 = stbi__exif_r8(&r);
+      if (bo0 == 'I' && bo1 == 'I') {
+         big_endian = 0;
+      } else if (bo0 == 'M' && bo1 == 'M') {
+         big_endian = 1;
+      } else {
+         return r.consumed;
+      }
+   }
+
+   {
+      int magic = (int) stbi__exif_r16(&r, big_endian);
+      if (magic != 0x002A) return r.consumed;
+   }
+
+   ifd_off = 0;
+   for (i = 0; i < 4; ++i) {
+      byte = stbi__exif_r8(&r);
+      ifd_off = big_endian ? (ifd_off << 8) | byte : ifd_off | ((stbi__uint32) byte << (8*i));
+   }
+
+   // IFD0 must sit inside the remaining TIFF data; only the common inline
+   // layout (offset 8) is followed, anything else just yields orientation 1
+   if (ifd_off < 8 || (int) (ifd_off - 8) > seg_len - r.consumed) return r.consumed;
+   stbi__skip(s, (int) (ifd_off - 8));
+   r.consumed += (int) (ifd_off - 8);
+   if (seg_len - r.consumed < 2) return r.consumed;
+
+   count = (int) stbi__exif_r16(&r, big_endian);
+   remaining = seg_len - r.consumed;
+
+   for (i = 0; i < count; ++i) {
+      int tag, type, num, value;
+      if (remaining < 12) break;
+      remaining -= 12;
+      tag  = (int) stbi__exif_r16(&r, big_endian);
+      type = (int) stbi__exif_r16(&r, big_endian);
+      num  = (int) stbi__exif_r32(&r, big_endian); // entry count is a 4-byte LONG
+      if (tag == 0x0112 && (type == 3 || type == 4) && num >= 1) {
+         // SHORT (3) or LONG (4); the first component fits in the inline value
+         value = (int) stbi__exif_r16(&r, big_endian);
+         if (value >= 1 && value <= 8) z->orientation = value;
+         stbi__skip(s, 2); // remaining 2 bytes of the 4-byte value field
+         r.consumed += 2;
+      } else {
+         stbi__skip(s, 4); // uninteresting 4-byte value/offset field
+         r.consumed += 4;
+      }
+   }
+
+   return r.consumed;
+}
+
 static int stbi__process_marker(stbi__jpeg *z, int m)
 {
    int L;
@@ -3256,6 +3370,10 @@ static int stbi__process_marker(stbi__jpeg *z, int m)
             z->app14_color_transform = stbi__get8(z->s); // color transform
             L -= 6;
          }
+      } else if (m == 0xE1 && L >= 6) { // EXIF APP1 segment
+         int consumed = stbi__process_exif_app1(z, L);
+         if (consumed < L) L -= consumed; // skip remaining payload bytes
+         else L = 0;
       }
 
       stbi__skip(z->s, L);
@@ -3930,6 +4048,36 @@ static stbi_uc stbi__blinn_8x8(stbi_uc x, stbi_uc y)
    return (stbi_uc) ((t + (t >>8)) >> 8);
 }
 
+// remap pixels according to EXIF Orientation (1-8). returns a new buffer
+// (or the same one for orientation 0/1) and updates *w/*h when axes swap.
+static stbi_uc *stbi__apply_orientation(stbi_uc *pixels, int *w, int *h, int n, int orientation)
+{
+   int x, y, src_x, src_y, swap;
+   stbi_uc *out;
+   if (orientation <= 1 || orientation > 8) return pixels;
+   swap = (orientation >= 5);
+   out = (stbi_uc *) stbi__malloc_mad3(n, swap ? *h : *w, swap ? *w : *h, 1);
+   if (!out) { STBI_FREE(pixels); return stbi__errpuc("outofmem", "Out of memory"); }
+   for (y = 0; y < *h; ++y) {
+      for (x = 0; x < *w; ++x) {
+         switch (orientation) {
+            case 2: src_x = *w - 1 - x; src_y = y;              break; // mirror horizontal
+            case 3: src_x = *w - 1 - x; src_y = *h - 1 - y;     break; // rotate 180
+            case 4: src_x = x;           src_y = *h - 1 - y;    break; // mirror vertical
+            case 5: src_x = y;           src_y = x;             break; // mirror + rotate 90 CW
+            case 6: src_x = y;           src_y = *h - 1 - x;    break; // rotate 90 CW
+            case 7: src_x = *h - 1 - y; src_y = *w - 1 - x;    break; // mirror + rotate 270 CW
+            default:src_x = *h - 1 - y; src_y = x;             break; // rotate 270 CW (8)
+         }
+         memcpy(out + ((swap ? *h : *w) * (swap ? x : y) + (swap ? y : x)) * n,
+                pixels + (src_y * *w + src_x) * n, n * sizeof(stbi_uc));
+      }
+   }
+   STBI_FREE(pixels);
+   if (swap) { int t = *w; *w = *h; *h = t; }
+   return out;
+}
+
 static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp, int req_comp)
 {
    int n, decode_n, is_rgb;
@@ -4085,6 +4233,13 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
             }
          }
       }
+      if (stbi__apply_exif_orientation_global) {
+         int ow = (int) z->s->img_x, oh = (int) z->s->img_y;
+         output = stbi__apply_orientation(output, &ow, &oh, n, z->orientation);
+         z->s->img_x = ow;
+         z->s->img_y = oh;
+         if (!output) { stbi__cleanup_jpeg(z); return NULL; }
+      }
       stbi__cleanup_jpeg(z);
       *out_x = z->s->img_x;
       *out_y = z->s->img_y;
@@ -4119,6 +4274,29 @@ static int stbi__jpeg_test(stbi__context *s)
    stbi__rewind(s);
    STBI_FREE(j);
    return r;
+}
+
+STBIDEF int stbi_get_exif_orientation(char const *filename)
+{
+   FILE *f = stbi__fopen(filename, "rb");
+   stbi__context s;
+   stbi__jpeg *j;
+   int orientation = 1;
+   if (!f) return 1;
+   stbi__start_callbacks(&s, &stbi__stdio_callbacks, (void *) f);
+   if (stbi__jpeg_test(&s)) {
+      j = (stbi__jpeg *) stbi__malloc(sizeof(stbi__jpeg));
+      if (j) {
+         memset(j, 0, sizeof(stbi__jpeg));
+         j->s = &s;
+         stbi__setup_jpeg(j);
+         if (stbi__decode_jpeg_header(j, STBI__SCAN_header) && j->orientation >= 1 && j->orientation <= 8)
+            orientation = j->orientation;
+         STBI_FREE(j);
+      }
+   }
+   fclose(f);
+   return orientation;
 }
 
 static int stbi__jpeg_info_raw(stbi__jpeg *j, int *x, int *y, int *comp)
