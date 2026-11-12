@@ -721,7 +721,7 @@ struct stbtt_fontinfo
 
    int numGlyphs;                     // number of glyphs, needed for range checking
 
-   int loca,head,glyf,hhea,hmtx,vhea,vmtx,kern,gpos,svg; // table locations as offset from start of .ttf
+   int loca,head,glyf,hhea,hmtx,vhea,vmtx,kern,gpos,gsub,svg; // table locations as offset from start of .ttf
    int index_map;                     // a cmap mapping for our chosen character encoding
    int indexToLocFormat;              // format needed to map from glyph index to glyph
 
@@ -751,6 +751,22 @@ STBTT_DEF int stbtt_FindGlyphIndex(const stbtt_fontinfo *info, int unicode_codep
 // going to process, then use glyph-based functions instead of the
 // codepoint-based functions.
 // Returns 0 if the character codepoint is not defined in the font.
+
+STBTT_DEF int stbtt_ApplyGlyphSubstitutions(const stbtt_fontinfo *info, int *glyphs, int num_glyphs, int *num_ligatures);
+// Runs the GSUB lookups reachable from the default script/language (DFLT/dflt)
+// on the given glyph sequence. Only lookup type 1 (single substitution) and
+// lookup type 4 (ligature substitution) are processed; other lookups are
+// skipped. Ligatures are matched longest-first. On return the substituted
+// sequence occupies the start of 'glyphs' and the new length is returned.
+// If non-NULL, '*num_ligatures' receives the number of ligature substitutions
+// that were applied. Returns the input unchanged when the font has no GSUB
+// table (or no usable default lookups).
+
+STBTT_DEF int stbtt_ApplyCodepointSubstitutions(const stbtt_fontinfo *info, const int *codepoints, int num_codepoints, int *glyphs_out, int max_glyphs, int *num_ligatures);
+// Maps each codepoint to a glyph with stbtt_FindGlyphIndex() and then applies
+// stbtt_ApplyGlyphSubstitutions() to the resulting sequence. Writes at most
+// 'max_glyphs' glyphs into 'glyphs_out'. Returns the number of glyphs written,
+// or -1 if the output buffer was too small.
 
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1419,6 +1435,7 @@ static int stbtt_InitFont_internal(stbtt_fontinfo *info, unsigned char *data, in
    info->vmtx = stbtt__find_table(data, fontstart, "vmtx"); // not required
    info->kern = stbtt__find_table(data, fontstart, "kern"); // not required
    info->gpos = stbtt__find_table(data, fontstart, "GPOS"); // not required
+   info->gsub = stbtt__find_table(data, fontstart, "GSUB"); // not required
 
    if (!cmap || !info->head || !info->hhea || !info->hmtx)
       return 0;
@@ -2688,6 +2705,299 @@ static stbtt_int32 stbtt__GetGlyphGPOSInfoAdvance(const stbtt_fontinfo *info, in
    }
 
    return 0;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// GSUB - glyph substitution (single substitution + ligature substitution)
+//
+// Only lookup type 1 (single) and type 4 (ligature) are processed; lookups
+// reached from the default script and default language system (DFLT/dflt,
+// otherwise the first available script) are collected in reference order.
+//
+
+// check whether 'glyph' belongs to the Coverage table at 'cov'
+static int stbtt__gsub_coverage(stbtt_uint8 *cov, int glyph)
+{
+   stbtt_uint16 format, count, i;
+   if (!cov) return 0;
+   format = ttUSHORT(cov);
+   if (format == 1) {
+      count = ttUSHORT(cov+2);
+      for (i=0; i < count; ++i)
+         if (ttUSHORT(cov+4+2*i) == glyph)
+            return 1;
+   } else if (format == 2) {
+      count = ttUSHORT(cov+2);
+      for (i=0; i < count; ++i) {
+         stbtt_uint8 *rec = cov+4+6*i;
+         stbtt_uint16 start = ttUSHORT(rec);
+         stbtt_uint16 end   = ttUSHORT(rec+2);
+         if ((unsigned)glyph >= start && (unsigned)glyph <= end)
+            return 1;
+       }
+   }
+   return 0;
+}
+
+// recover the coverage index of 'glyph' (only needed for ligature sets)
+static int stbtt__gsub_coverage_index(stbtt_uint8 *cov, int glyph)
+{
+   stbtt_uint16 format, count, i;
+   if (!cov) return -1;
+   format = ttUSHORT(cov);
+   if (format == 1) {
+      count = ttUSHORT(cov+2);
+      for (i=0; i < count; ++i)
+         if (ttUSHORT(cov+4+2*i) == glyph)
+            return i;
+   } else if (format == 2) {
+      int index = 0;
+      count = ttUSHORT(cov+2);
+      for (i=0; i < count; ++i) {
+         stbtt_uint8 *rec = cov+4+6*i;
+         stbtt_uint16 start = ttUSHORT(rec);
+         stbtt_uint16 end   = ttUSHORT(rec+2);
+         stbtt_uint16 delta = ttUSHORT(rec+4);
+         if ((unsigned)glyph >= start && (unsigned)glyph <= end)
+            return index + (glyph - start);
+         index += end - start + 1 - delta;
+      }
+   }
+   return -1;
+}
+
+// lookup type 1: single substitution (formats 1 and 2)
+static int stbtt__gsub_apply_single(stbtt_uint8 *table, int glyph, int *out_glyph)
+{
+   stbtt_uint16 format = ttUSHORT(table);
+   if (format == 1) {
+      // SingleSubstFmt1: Format(0), CoverageOffset(2), DeltaGlyphID(4)
+      stbtt_uint16 coverage_off = ttUSHORT(table+2);
+      stbtt_int16  delta        = ttSHORT(table+4);
+      if (stbtt__gsub_coverage(table+coverage_off, glyph)) {
+         *out_glyph = (stbtt_uint16)(glyph + delta);
+         return 1;
+      }
+   } else if (format == 2) {
+      // SingleSubstFmt2: Format(0), CoverageOffset(2), GlyphCount(4), Substitute[](6)
+      stbtt_uint16 coverage_off = ttUSHORT(table+2);
+      stbtt_uint16 count        = ttUSHORT(table+4);
+      stbtt_uint16 idx;
+      if (!stbtt__gsub_coverage(table+coverage_off, glyph))
+         return 0;
+      idx = (stbtt_uint16) stbtt__gsub_coverage_index(table+coverage_off, glyph);
+      if (idx < count) {
+         *out_glyph = ttUSHORT(table+6+2*idx);
+         return 1;
+      }
+   }
+   return 0;
+}
+
+// lookup type 4: ligature substitution; returns the number of input glyphs
+// consumed (0 = no match) and writes the replacement glyph. Longest match wins.
+static int stbtt__gsub_apply_ligature(stbtt_uint8 *table, const int *glyphs, int num_glyphs, int *out_glyph)
+{
+   // LigatureSubstFmt1: Format(0), CoverageOffset(2), LigSetCount(4), LigSetOffset[](6)
+   stbtt_uint16 coverage_off = ttUSHORT(table+2);
+   stbtt_uint16 set_count    = ttUSHORT(table+4);
+   stbtt_uint16 best = 0;
+   int coverage_index, lig_set_off, j, k;
+   stbtt_uint8 *lig_set;
+   stbtt_uint16 lig_count;
+
+   if (!stbtt__gsub_coverage(table+coverage_off, glyphs[0]))
+      return 0;
+   coverage_index = stbtt__gsub_coverage_index(table+coverage_off, glyphs[0]);
+   if (coverage_index < 0 || coverage_index >= set_count)
+      return 0;
+
+   lig_set_off = ttUSHORT(table+6+2*coverage_index);
+   if (!lig_set_off) return 0;
+   lig_set = table + lig_set_off;
+   lig_count = ttUSHORT(lig_set);
+
+   for (j=0; j < lig_count; ++j) {
+      // LigatureSet: LigatureCount(0..1), LigatureOffset[](2...) (offsets from set start)
+      stbtt_uint8 *lig = lig_set + ttUSHORT(lig_set+2+4*j);
+      stbtt_uint16 components = ttUSHORT(lig+2); // includes the first glyph
+      if (components < 2 || components > (stbtt_uint16) num_glyphs) continue;
+      for (k=1; k < components; ++k)
+         if (ttUSHORT(lig+4+2*(k-1)) != glyphs[k])
+            break;
+      if (k == components && components > best) {
+         best = components;
+         *out_glyph = ttUSHORT(lig);
+      }
+   }
+   return best;
+}
+
+// apply one lookup (which may hold several subtables); returns the number of
+// input glyphs consumed and writes the replacement glyph
+static int stbtt__gsub_apply_lookup(stbtt_uint8 *lookup, const int *glyphs, int num_glyphs, int *out_glyph, int *is_ligature)
+{
+   stbtt_uint16 lookup_type = ttUSHORT(lookup);
+   stbtt_uint16 sub_count   = ttUSHORT(lookup+4);
+   stbtt_uint16 i;
+   *is_ligature = 0;
+   if (lookup_type != 1 && lookup_type != 4)
+      return 0;
+   for (i=0; i < sub_count; ++i) {
+      // LookupTable: Type(0), Flag(2), SubTableCount(4), SubTableOffset[](6...)
+      stbtt_uint8 *sub = lookup + ttUSHORT(lookup+6+2*i);
+      if (lookup_type == 1) {
+         if (stbtt__gsub_apply_single(sub, glyphs[0], out_glyph))
+            return 1;
+      } else {
+         int consumed = stbtt__gsub_apply_ligature(sub, glyphs, num_glyphs, out_glyph);
+         if (consumed) { *is_ligature = 1; return consumed; }
+      }
+   }
+   return 0;
+}
+
+// collect lookup indices reachable from the default script/default langsys
+static int stbtt__gsub_default_lookups(stbtt_uint8 *gsub, int **indices_out, int *count_out)
+{
+   stbtt_uint16 script_list_off  = ttUSHORT(gsub+4);
+   stbtt_uint16 feature_list_off = ttUSHORT(gsub+6);
+   stbtt_uint8 *script_list, *feature_list;
+   stbtt_uint16 script_count, i, j, script_off = 0, langsys_off = 0;
+   stbtt_uint16 feature_count, *feature_idx, count = 0, cap = 16;
+   int *indices;
+
+   *indices_out = NULL;
+   *count_out = 0;
+   if (!script_list_off || !feature_list_off)
+      return 0;
+   script_list  = gsub + script_list_off;
+   feature_list = gsub + feature_list_off;
+   script_count = ttUSHORT(script_list);
+   if (!script_count) return 0;
+
+   // prefer DFLT/dflt, otherwise take the first script with a default langsys
+   for (i=0; i < script_count; ++i) {
+      stbtt_uint8 *rec = script_list + 2 + 6*i;
+      stbtt_uint16 off = ttUSHORT(rec+4);
+      if (stbtt_tag4(rec, 'D','F','L','T') || stbtt_tag4(rec,'d','f','l','t')) {
+         script_off = off;
+         break;
+      }
+      if (!script_off && ttUSHORT(script_list+off)) // ScriptTable.DefaultLangSysOffset
+         script_off = off;
+   }
+   if (!script_off)
+      script_off = ttUSHORT(script_list+2+4);
+
+   {
+      stbtt_uint8 *script = script_list + script_off;
+      // ScriptTable: DefaultLangSysOffset(0..1), LangSysCount(2..3), records...
+      langsys_off = ttUSHORT(script);
+      if (!langsys_off && ttUSHORT(script+2))
+         langsys_off = ttUSHORT(script+8); // first LangSysRecord's offset field
+   }
+   if (!langsys_off) return 0;
+
+   {
+      stbtt_uint8 *langsys = script_list + script_off + langsys_off;
+      // LangSysTable: LookupOrder(0..1), ReqFeatureIndex(2..3), FeatureIndexCount(4..5)
+      feature_count = ttUSHORT(langsys+4);
+      feature_idx = (stbtt_uint16 *) STBTT_malloc((feature_count ? feature_count : 1) * sizeof(stbtt_uint16), NULL);
+      if (!feature_idx) return 0;
+      for (i=0; i < feature_count; ++i)
+         feature_idx[i] = ttUSHORT(langsys+6+2*i);
+   }
+
+   indices = (int *) STBTT_malloc(cap * sizeof(int), NULL);
+   if (!indices) { STBTT_free(feature_idx, NULL); return 0; }
+   for (i=0; i < feature_count; ++i) {
+      stbtt_uint8 *frec;
+      stbtt_uint16 f_off, lookup_count;
+      if (feature_idx[i] >= ttUSHORT(feature_list)) continue;
+      // FeatureRecord at base+6*i: FeatureTag(0..3), FeatureOffset(4..5)
+      f_off = ttUSHORT((feature_list + 2 + 6*feature_idx[i]) + 4);
+      frec = feature_list + f_off;
+      // FeatureTable: FeatureParams(0..1), LookupCount(2..3), LookupIndex[]...
+      lookup_count = ttUSHORT(frec+2);
+      for (j=0; j < lookup_count; ++j) {
+         stbtt_uint16 li = ttUSHORT(frec+4+2*j);
+         if (count == cap) {
+            int *grown = (int *) STBTT_malloc(cap*2*sizeof(int), NULL);
+            int k;
+            if (!grown) break;
+            for (k=0; k < cap; ++k) grown[k] = indices[k];
+            STBTT_free(indices, NULL);
+            indices = grown;
+            cap *= 2;
+         }
+         indices[count++] = li;
+      }
+   }
+   STBTT_free(feature_idx, NULL);
+   *indices_out = indices;
+   *count_out = count;
+   return 1;
+}
+
+STBTT_DEF int stbtt_ApplyGlyphSubstitutions(const stbtt_fontinfo *info, int *glyphs, int num_glyphs, int *num_ligatures)
+{
+   stbtt_uint8 *gsub, *lookup_list;
+   stbtt_uint16 lookup_list_off;
+   int *lookup_idx = NULL, lookup_count = 0, li;
+   int pos, lig_count = 0;
+
+   if (num_ligatures) *num_ligatures = 0;
+   if (num_glyphs <= 0 || !info->gsub)
+      return num_glyphs;
+   gsub = info->data + info->gsub;
+   lookup_list_off = ttUSHORT(gsub+8);
+   if (!lookup_list_off)
+      return num_glyphs;
+   lookup_list = gsub + lookup_list_off;
+   if (!stbtt__gsub_default_lookups(gsub, &lookup_idx, &lookup_count))
+      return num_glyphs;
+
+   pos = 0;
+   while (pos < num_glyphs) {
+      int moved = 0;
+      for (li=0; li < lookup_count; ++li) {
+         stbtt_uint16 ltab_index = (stbtt_uint16) lookup_idx[li];
+         stbtt_uint8 *lookup;
+         int replacement, consumed, is_lig, tail;
+         if (ltab_index >= ttUSHORT(lookup_list)) continue;
+         lookup = lookup_list + ttUSHORT(lookup_list + 2 + 2*ltab_index);
+         consumed = stbtt__gsub_apply_lookup(lookup, glyphs+pos, num_glyphs-pos, &replacement, &is_lig);
+         if (!consumed)
+            continue;
+         glyphs[pos] = replacement;
+         if (consumed > 1) {
+            for (tail = pos+1; tail + (consumed-1) < num_glyphs; ++tail)
+               glyphs[tail] = glyphs[tail + (consumed-1)];
+            num_glyphs -= (consumed-1);
+            if (is_lig) ++lig_count;
+         }
+         moved = 1;
+         break;
+      }
+      if (!moved)
+         ++pos;
+   }
+   STBTT_free(lookup_idx, NULL);
+   if (num_ligatures) *num_ligatures = lig_count;
+   return num_glyphs;
+}
+
+STBTT_DEF int stbtt_ApplyCodepointSubstitutions(const stbtt_fontinfo *info, const int *codepoints, int num_codepoints, int *glyphs_out, int max_glyphs, int *num_ligatures)
+{
+   int i, count;
+   if (num_codepoints > max_glyphs)
+      return -1;
+   for (i=0; i < num_codepoints; ++i)
+      glyphs_out[i] = stbtt_FindGlyphIndex(info, codepoints[i]);
+   count = stbtt_ApplyGlyphSubstitutions(info, glyphs_out, num_codepoints, num_ligatures);
+   return count;
 }
 
 STBTT_DEF int  stbtt_GetGlyphKernAdvance(const stbtt_fontinfo *info, int g1, int g2)

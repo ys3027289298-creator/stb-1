@@ -41,6 +41,52 @@ int main(int argc, char **argv)
    unsigned char *bitmap;
    int w,h,i,j,c = (argc > 1 ? atoi(argv[1]) : '@'), s = (argc > 2 ? atoi(argv[2]) : 32);
 
+#ifdef TT_GSUB_TEST
+   // GSUB sample: argv[1] = font path, argv[2] = sample text.
+   // Prints the raw glyph sequence, the substituted sequence and the
+   // number of ligature substitutions, then exits without waiting for input.
+   {
+      FILE *fp = fopen(argc > 1 ? argv[1] : "", "rb");
+      long size;
+      char *text;
+      int *codepoints, *glyphs;
+      int len, out_len, ligs, k;
+      if (!fp) { fprintf(stderr, "cannot open font\n"); return 1; }
+      fseek(fp, 0, SEEK_END);
+      size = ftell(fp);
+      fseek(fp, 0, SEEK_SET);
+      {
+         unsigned char *buf = (unsigned char *) malloc((size_t) size);
+         fread(buf, 1, (size_t) size, fp);
+         fclose(fp);
+         if (!stbtt_InitFont(&font, buf, stbtt_GetFontOffsetForIndex(buf, 0))) {
+            fprintf(stderr, "stbtt_InitFont failed\n");
+            return 1;
+         }
+      }
+      text = argc > 2 ? argv[2] : "";
+      len = (int) strlen(text);
+      codepoints = (int *) malloc((size_t) len * sizeof(int));
+      glyphs = (int *) malloc((size_t) len * sizeof(int));
+      for (k=0; k < len; ++k)
+         codepoints[k] = (unsigned char) text[k];
+      printf("sample: %s\n", text);
+      printf("raw glyphs:");
+      for (k=0; k < len; ++k)
+         printf(" %d", stbtt_FindGlyphIndex(&font, codepoints[k]));
+      printf("\n");
+      out_len = stbtt_ApplyCodepointSubstitutions(&font, codepoints, len, glyphs, len, &ligs);
+      printf("substituted glyphs:");
+      for (k=0; k < out_len; ++k)
+         printf(" %d", glyphs[k]);
+      printf("\n");
+      printf("ligature substitutions: %d\n", ligs);
+      free(codepoints);
+      free(glyphs);
+      return 0;
+   }
+#endif
+
    for (j=1; j < 0x800; ++j) {
       char buffer[4] = { (j>>8), (j&255), 0,0 };
       char decode[10];
