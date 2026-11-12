@@ -50,6 +50,8 @@ USAGE:
      int stbi_write_jpg(char const *filename, int w, int h, int comp, const void *data, int quality);
      int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
 
+     int stbi_write_pic(char const *filename, int w, int h, int comp, const void *data);
+
      void stbi_flip_vertically_on_write(int flag); // flag is non-zero to flip data vertically
 
    In addition there are four more functions which accept the "ptrdiff_t stride_in_bytes" argument, new functions for
@@ -125,6 +127,12 @@ USAGE:
    TGA supports RLE or non-RLE compressed data. To use non-RLE-compressed
    data, set the global variable 'stbi_write_tga_with_rle' to 0.
 
+   PIC (Softimage PIC) supports 3- and 4-component (RGB/RGBA) 8-bit data.
+   By default the channel packets use mixed RLE (packet type 2); set the
+   global variable 'stbi_write_pic_with_rle' to 0 to write uncompressed
+   packets (type 0). The 80-byte comment area of the 104-byte header is
+   left zero, and the output is readable by stb_image's PIC loader.
+
    JPEG does ignore alpha channels in input data; quality is between 1 and 100.
    Higher quality looks better but results in a bigger image.
    JPEG baseline (no JPEG progressive).
@@ -191,6 +199,7 @@ LICENSE
 STBIWDEF int stbi_write_tga_with_rle;
 STBIWDEF int stbi_write_png_compression_level;
 STBIWDEF int stbi_write_force_png_filter;
+STBIWDEF int stbi_write_pic_with_rle;
 #endif
 
 #ifndef STBI_WRITE_NO_STDIO
@@ -204,6 +213,7 @@ STBIWDEF int stbi_write_bmp_strided(char const *filename, int w, int h, int comp
 STBIWDEF int stbi_write_tga_strided(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_hdr_strided(char const *filename, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_jpg_strided(char const *filename, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
+STBIWDEF int stbi_write_pic(char const *filename, int w, int h, int comp, const void  *data);
 
 #ifdef STBIW_WINDOWS_UTF8
 STBIWDEF int stbiw_convert_wchar_to_utf8(char *buffer, size_t bufferlen, const wchar_t* input);
@@ -224,6 +234,8 @@ STBIWDEF int stbi_write_hdr_strided_to_func(stbi_write_func *func, void *context
 STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
 
 STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
+
+STBIWDEF int stbi_write_pic_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 
 #endif//INCLUDE_STB_IMAGE_WRITE_H
 
@@ -284,10 +296,12 @@ STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
 static int stbi_write_png_compression_level = 8;
 static int stbi_write_tga_with_rle = 1;
 static int stbi_write_force_png_filter = -1;
+static int stbi_write_pic_with_rle = 1;
 #else
 int stbi_write_png_compression_level = 8;
 int stbi_write_tga_with_rle = 1;
 int stbi_write_force_png_filter = -1;
+int stbi_write_pic_with_rle = 1;
 #endif
 
 static int stbi__flip_vertically_on_write = 0;
@@ -378,7 +392,7 @@ static int stbi__start_write_file(stbi__write_context *s, const char *filename)
 
 static int stbi__end_write_file(stbi__write_context *s, int result)
 {
-   if (fclose((FILE *)s->context) != 0)
+   if (fclose((FILE *)s->file_maybe) != 0)
        s->ok = 0;
    return s->ok ? result : 0;
 }
@@ -738,6 +752,176 @@ STBIWDEF int stbi_write_tga(char const *filename, int x, int y, int comp, const 
    return stbi_write_tga_strided(filename, x, y, comp, data, 0);
 }
 #endif
+
+// *************************************************************************************************
+// Softimage PIC writer
+// layout matches stb_image's PIC loader (deprecated/stb_image_pic.h):
+//   104-byte header: 4-byte magic, version byte, 80-byte comment (zeroed),
+//   3 pad bytes, "PICT", 16-bit width/height, 32-bit ratio, 16-bit fields/pad
+//   followed by a chain of 4-byte channel packets (chained,size,type,channel),
+//   then per-scanline channel data. packet type 0 = uncompressed, type 2 =
+//   mixed RLE (count<128 raw run of count+1, count>=129 repeated count-127).
+
+#define STBIW__PIC_MAGIC_0 0x53
+#define STBIW__PIC_MAGIC_1 0x80
+#define STBIW__PIC_MAGIC_2 0xF6
+#define STBIW__PIC_MAGIC_3 0x34
+
+// channel mask bits, bit 0x80..0x08 = R,G,B,A in the loader's read order
+#define STBIW__PIC_RGB 0xE0
+#define STBIW__PIC_A   0x10
+
+static void stbiw__pic_write16be(stbi__write_context *s, int v)
+{
+   stbiw__write1(s, STBIW_UCHAR(v >> 8));
+   stbiw__write1(s, STBIW_UCHAR(v));
+}
+
+static void stbiw__pic_write32be(stbi__write_context *s, stbiw_uint32 v)
+{
+   stbiw__write1(s, STBIW_UCHAR(v >> 24));
+   stbiw__write1(s, STBIW_UCHAR(v >> 16));
+   stbiw__write1(s, STBIW_UCHAR(v >> 8));
+   stbiw__write1(s, STBIW_UCHAR(v));
+}
+
+
+// write one scanline of one channel packet. the packet's channel mask may
+// cover several channels (RGB = 0xE0), so each count applies to a whole
+// pixel's worth of channels in mask order (R,G,B[,A]).
+static void stbiw__pic_write_row(stbi__write_context *s, int x, int comp, int first_chan,
+                                 int nch, const unsigned char *row, int rle)
+{
+   int i = 0;
+
+   if (!rle) {
+      for (i = 0; i < x; ++i) {
+         int k;
+         for (k = 0; k < nch; ++k)
+            stbiw__write1(s, row[i * comp + first_chan + k]);
+      }
+      return;
+   }
+
+   while (i < x) {
+      int run = 1, k, c;
+      while (i + run < x && run < 127 &&
+             !memcmp(row + i * comp + first_chan,
+                     row + (i + run) * comp + first_chan, (size_t) nch))
+         ++run;
+
+      if (run >= 2) { // repeated pixel: count byte 129..254 = run + 127
+         stbiw__write1(s, STBIW_UCHAR(run + 127));
+         for (k = 0; k < nch; ++k)
+            stbiw__write1(s, row[i * comp + first_chan + k]);
+         i += run;
+      } else { // raw run: collect up to 127 non-repeating pixels, header = len - 1
+         unsigned char raw[127 * 4];
+         int len = 0;
+         while (i < x && len < 127) {
+            if (len > 0 && i + 1 < x &&
+                !memcmp(row + i * comp + first_chan,
+                        row + (i + 1) * comp + first_chan, (size_t) nch))
+               break;
+            for (k = 0; k < nch; ++k)
+               raw[len * nch + k] = row[i * comp + first_chan + k];
+            ++len;
+            ++i;
+         }
+         stbiw__write1(s, STBIW_UCHAR(len - 1));
+         for (c = 0; c < len * nch; ++c)
+            stbiw__write1(s, raw[c]);
+      }
+   }
+}
+
+static int stbi_write_pic_core(stbi__write_context *s, int x, int y, int comp, const void *data)
+{
+   int rle, has_alpha, num_packets, packet_idx, j, jend, jdir, k;
+   struct { unsigned char first_chan; unsigned char nch; } packets[2];
+
+   if (!data || !stbiw__validate_dimensions(x, y, comp))
+      return 0;
+   if (comp != 3 && comp != 4) // PIC channel packets only cover RGB/RGBA
+      return 0;
+
+   rle = stbi_write_pic_with_rle != 0;
+   has_alpha = comp == 4;
+   num_packets = has_alpha ? 2 : 1;
+   packets[0].first_chan = 0; // RGB packet, mask 0xE0
+   packets[0].nch = 3;
+   if (has_alpha)
+      packets[1].first_chan = 3; // A packet, mask 0x10, 1 channel
+   if (has_alpha)
+      packets[1].nch = 1;
+
+   // 104-byte header
+   stbiw__write1(s, STBIW__PIC_MAGIC_0);
+   stbiw__write1(s, STBIW__PIC_MAGIC_1);
+   stbiw__write1(s, STBIW__PIC_MAGIC_2);
+   stbiw__write1(s, STBIW__PIC_MAGIC_3);
+   stbiw__write1(s, 1); // version
+   for (k = 0; k < 80; ++k)
+      stbiw__write1(s, 0); // 80-byte comment area, left zero
+   stbiw__write1(s, 0);
+   stbiw__write1(s, 0);
+   stbiw__write1(s, 0);
+   stbiw__write1(s, 'P');
+   stbiw__write1(s, 'I');
+   stbiw__write1(s, 'C');
+   stbiw__write1(s, 'T');
+   stbiw__pic_write16be(s, x);
+   stbiw__pic_write16be(s, y);
+   stbiw__pic_write32be(s, 0x00010000u); // pixel ratio 1.0 in 16.16 fixed point
+   stbiw__pic_write16be(s, 0); // fields
+   stbiw__pic_write16be(s, 0); // pad
+
+   // channel packet chain: chained flag set on all but the last packet
+   for (packet_idx = 0; packet_idx < num_packets; ++packet_idx) {
+      stbiw__write1(s, packet_idx + 1 < num_packets ? 1 : 0); // chained
+      stbiw__write1(s, 8);                                    // 8 bits per channel
+      stbiw__write1(s, rle ? 2 : 0);                          // compression type
+      stbiw__write1(s, packet_idx == 0 ? STBIW__PIC_RGB : STBIW__PIC_A);
+   }
+
+   // PIC scanlines are stored top-to-bottom; flip reverses that order
+   if (stbi__flip_vertically_on_write) {
+      j = y - 1; jend = -1; jdir = -1;
+   } else {
+      j = 0; jend = y; jdir = 1;
+   }
+
+   for (; j != jend; j += jdir) {
+      const unsigned char *row = (const unsigned char *) data + (ptrdiff_t) j * x * comp;
+      for (packet_idx = 0; packet_idx < num_packets; ++packet_idx)
+         stbiw__pic_write_row(s, x, comp, packets[packet_idx].first_chan,
+                              packets[packet_idx].nch, row, rle);
+   }
+
+   stbiw__write_flush(s);
+   return s->ok;
+}
+
+STBIWDEF int stbi_write_pic_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   stbi__start_write_callbacks(&s, func, context);
+   return stbi_write_pic_core(&s, w, h, comp, data);
+}
+
+#ifndef STBI_WRITE_NO_STDIO
+STBIWDEF int stbi_write_pic(char const *filename, int w, int h, int comp, const void *data)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   if (stbi__start_write_file(&s, filename)) {
+      int r = stbi_write_pic_core(&s, w, h, comp, data);
+      return stbi__end_write_file(&s, r);
+   } else
+      return 0;
+}
+#endif //!STBI_WRITE_NO_STDIO
 
 // *************************************************************************************************
 // Radiance RGBE HDR writer

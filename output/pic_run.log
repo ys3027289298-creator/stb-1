@@ -1,0 +1,11 @@
+== case1: small 7x5 RGB, RLE + uncompressed ==
+output/small_rle.pic: load 7x5 comp=3, differing pixels/bytes=0
+output/small_raw.pic: load 7x5 comp=3, differing pixels/bytes=0
+== case2: large 256x192 RGB (long runs/raw spans), RLE ==
+output/big_rle.pic: load 256x192 comp=3, differing pixels/bytes=0
+== case3: 7x5 RGBA with alpha, RLE + uncompressed ==
+output/rgba_rle.pic: load 7x5 comp=4, differing pixels/bytes=0
+output/rgba_raw.pic: load 7x5 comp=4, differing pixels/bytes=0
+== case4: bad parameters (expect all returns 0) ==
+bad comp=0 zero dims=0 null data=0
+RESULT: all roundtrips identical

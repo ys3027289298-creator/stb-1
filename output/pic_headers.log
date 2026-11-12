@@ -1,0 +1,15 @@
+ 53 80 f6 34 01 00 00 00 00 00 00 00 00 00 00 00
+ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+*
+ 00 00 00 00 00 00 00 00 50 49 43 54 00 07 00 05
+ 00 01 00 00 00 00 00 00 00 08 02 e0 06 00 30 55
+ 00 08 02 e0
+ 00 08 00 e0
+-rw-r--r-- 1 ys ys      0 Nov 13 00:09 output/bad1.pic
+-rw-r--r-- 1 ys ys      0 Nov 13 00:09 output/bad2.pic
+-rw-r--r-- 1 ys ys      0 Nov 13 00:09 output/bad3.pic
+-rw-r--r-- 1 ys ys 148140 Nov 13 00:09 output/big_rle.pic
+-rw-r--r-- 1 ys ys    252 Nov 13 00:09 output/rgba_raw.pic
+-rw-r--r-- 1 ys ys    262 Nov 13 00:09 output/rgba_rle.pic
+-rw-r--r-- 1 ys ys    213 Nov 13 00:09 output/small_raw.pic
+-rw-r--r-- 1 ys ys    218 Nov 13 00:09 output/small_rle.pic

@@ -1,0 +1,65 @@
+
+==================== stage 1/4: compile pic_write_test (stb_image_write PIC writer + PIC-capable stb_image) ====================
+build OK
+
+==================== stage 2/4: four cases (small, large, RGBA, bad params); write then read back, print diffs ====================
+== case1: small 7x5 RGB, RLE + uncompressed ==
+output/small_rle.pic: load 7x5 comp=3, differing pixels/bytes=0
+output/small_raw.pic: load 7x5 comp=3, differing pixels/bytes=0
+== case2: large 256x192 RGB (long runs/raw spans), RLE ==
+output/big_rle.pic: load 256x192 comp=3, differing pixels/bytes=0
+== case3: 7x5 RGBA with alpha, RLE + uncompressed ==
+output/rgba_rle.pic: load 7x5 comp=4, differing pixels/bytes=0
+output/rgba_raw.pic: load 7x5 comp=4, differing pixels/bytes=0
+== case4: bad parameters (expect all returns 0) ==
+bad comp=0 zero dims=0 null data=0
+RESULT: all roundtrips identical
+
+==================== stage 3/4: inspect 104-byte header, packet chain and RLE/raw compression bytes ====================
+--- small_rle.pic first 112 bytes (magic, 80-byte comment, PICT, dims, packets) ---
+ 53 80 f6 34 01 00 00 00 00 00 00 00 00 00 00 00
+ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+*
+ 00 00 00 00 00 00 00 00 50 49 43 54 00 07 00 05
+ 00 01 00 00 00 00 00 00 00 08 02 e0 06 00 30 55
+--- packet chain: RLE type=2 (small_rle) vs uncompressed type=0 (small_raw) ---
+ 00 08 02 e0
+ 00 08 00 e0
+-rw-r--r-- 1 ys ys      0 Nov 13 00:09 output/bad1.pic
+-rw-r--r-- 1 ys ys      0 Nov 13 00:09 output/bad2.pic
+-rw-r--r-- 1 ys ys      0 Nov 13 00:09 output/bad3.pic
+-rw-r--r-- 1 ys ys 148140 Nov 13 00:09 output/big_rle.pic
+-rw-r--r-- 1 ys ys    252 Nov 13 00:09 output/rgba_raw.pic
+-rw-r--r-- 1 ys ys    262 Nov 13 00:09 output/rgba_rle.pic
+-rw-r--r-- 1 ys ys    213 Nov 13 00:09 output/small_raw.pic
+-rw-r--r-- 1 ys ys    218 Nov 13 00:09 output/small_rle.pic
+
+==================== stage 4/4: compile repo example image_write_test as regression ====================
+bad1.pic
+bad2.pic
+bad3.pic
+big_rle.pic
+demo.cast
+demo.log
+image_write_test
+pic_build.log
+pic_filelist.log
+pic_headers.log
+pic_run.log
+pic_write_test
+rgba_raw.pic
+rgba_rle.pic
+small_raw.pic
+small_rle.pic
+wr6x5_flip.bmp
+wr6x5_flip.hdr
+wr6x5_flip.jpg
+wr6x5_flip.png
+wr6x5_flip.tga
+wr6x5_regular.bmp
+wr6x5_regular.hdr
+wr6x5_regular.jpg
+wr6x5_regular.png
+wr6x5_regular.tga
+
+all done; artifacts in output/
