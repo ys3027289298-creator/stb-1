@@ -731,6 +731,9 @@ struct stbtt_fontinfo
    stbtt__buf subrs;                  // private charstring subroutines index
    stbtt__buf fontdicts;              // array of font dicts
    stbtt__buf fdselect;               // map from glyph to fontdict
+   int cff2;                          // outlines are CFF2 (may carry variation data)
+   int num_vsindices;                 // number of parsed CFF2 variation stores
+   int region_counts[16];             // region count per vsindex (default instance)
 };
 
 STBTT_DEF int stbtt_InitFont(stbtt_fontinfo *info, const unsigned char *data, int offset);
@@ -1165,7 +1168,8 @@ static stbtt_uint8 stbtt__buf_peek8(stbtt__buf *b)
 
 static void stbtt__buf_seek(stbtt__buf *b, int o)
 {
-   STBTT_assert(!(o > b->size || o < 0));
+   // malformed CFF/CFF2 tables can carry out-of-range offsets; clamp instead
+   // of asserting so corrupted fonts fail gracefully rather than aborting
    b->cursor = (o > b->size || o < 0) ? b->size : o;
 }
 
@@ -1220,6 +1224,21 @@ static stbtt__buf stbtt__cff_get_index(stbtt__buf *b)
    return stbtt__buf_range(b, start, b->cursor - start);
 }
 
+// CFF2 INDEXes use a 4-byte count instead of CFF's 2-byte count.
+static stbtt__buf stbtt__cff2_get_index(stbtt__buf *b)
+{
+   int count, start, offsize;
+   start = b->cursor;
+   count = (int) stbtt__buf_get32(b);
+   if (count) {
+      offsize = stbtt__buf_get8(b);
+      if (offsize < 1 || offsize > 4) { stbtt__buf_seek(b, b->size); return stbtt__new_buf(NULL, 0); }
+      stbtt__buf_skip(b, offsize * count);
+      stbtt__buf_skip(b, stbtt__buf_get(b, offsize) - 1);
+   }
+   return stbtt__buf_range(b, start, b->cursor - start);
+}
+
 static stbtt_uint32 stbtt__cff_int(stbtt__buf *b)
 {
    int b0 = stbtt__buf_get8(b);
@@ -1228,13 +1247,13 @@ static stbtt_uint32 stbtt__cff_int(stbtt__buf *b)
    else if (b0 >= 251 && b0 <= 254) return -(b0 - 251)*256 - stbtt__buf_get8(b) - 108;
    else if (b0 == 28)               return stbtt__buf_get16(b);
    else if (b0 == 29)               return stbtt__buf_get32(b);
-   STBTT_assert(0);
+   // malformed/unsupported operand byte (e.g. real-number encoding 30)
    return 0;
 }
 
 static void stbtt__cff_skip_operand(stbtt__buf *b) {
    int v, b0 = stbtt__buf_peek8(b);
-   STBTT_assert(b0 >= 28);
+   if (b0 < 28) { stbtt__buf_skip(b, 1); return; }
    if (b0 == 30) {
       stbtt__buf_skip(b, 1);
       while (b->cursor < b->size) {
@@ -1290,6 +1309,67 @@ static stbtt__buf stbtt__cff_index_get(stbtt__buf b, int i)
    return stbtt__buf_range(&b, 2+(count+1)*offsize+start, end - start);
 }
 
+static int stbtt__cff2_index_count(stbtt__buf *b)
+{
+   stbtt__buf_seek(b, 0);
+   return (int) stbtt__buf_get32(b);
+}
+
+static stbtt__buf stbtt__cff2_index_get(stbtt__buf b, int i)
+{
+   int count, offsize, start, end, header;
+   stbtt__buf_seek(&b, 0);
+   count = (int) stbtt__buf_get32(&b);
+   offsize = stbtt__buf_get8(&b);
+   if (i < 0 || i >= count || offsize < 1 || offsize > 4) return stbtt__new_buf(NULL, 0);
+   stbtt__buf_skip(&b, i*offsize);
+   start = stbtt__buf_get(&b, offsize);
+   end = stbtt__buf_get(&b, offsize);
+   header = 4 + (count+1)*offsize;
+   return stbtt__buf_range(&b, header+start, end - start);
+}
+
+// Parses just enough of a CFF2 VariationStore (the OpenType ItemVariationStore
+// binary layout) to record each VarData's region count, which is all the
+// charstring interpreter needs to collapse blend operators to the default
+// instance. Returns the number of variation stores, 0 on failure.
+static int stbtt__cff2_parse_vstore(stbtt_fontinfo *info, stbtt__buf cff, int vstore_off)
+{
+   stbtt__buf b;
+   int format, region_list_off, var_data_count, i, body_off;
+   if (!vstore_off || vstore_off >= cff.size) return 0;
+   if (cff.size - vstore_off < 10) return 0;
+   // the CFF2 VarStore data is prefixed with a Card16 byte length
+   body_off = vstore_off + 2;
+   b = stbtt__buf_range(&cff, body_off, cff.size - body_off);
+   format = stbtt__buf_get16(&b);
+   if (format != 1) return 0;
+   region_list_off = (int) stbtt__buf_get32(&b);
+   var_data_count = stbtt__buf_get16(&b);
+   if (var_data_count > 16) var_data_count = 16;
+   // read each VarData's offset (a 32-bit offset from the VarStore start)
+   for (i = 0; i < var_data_count; i++) {
+      int var_data_off = (int) stbtt__buf_get32(&b);
+      // offsets are relative to the ItemVariationStore body
+      if (var_data_off < 0 || body_off + var_data_off >= cff.size) { info->region_counts[i] = 0; continue; }
+      stbtt__buf vd = stbtt__buf_range(&cff, body_off + var_data_off, cff.size - body_off - var_data_off);
+      if (vd.size < 6) { info->region_counts[i] = 0; continue; }
+      stbtt__buf_skip(&vd, 4);                          // ItemCount, NumShorts
+      info->region_counts[i] = stbtt__buf_get16(&vd);   // VarRegionCount
+   }
+   // validate the region list offset/range so a malformed store can't mislead us
+   if (region_list_off < 0 || region_list_off + 4 > b.size ||
+       body_off + region_list_off >= cff.size) return 0;
+   {
+      // the VarRegionList offset is relative to the ItemVariationStore body
+      stbtt__buf rl = stbtt__buf_range(&cff, body_off + region_list_off, cff.size - body_off - region_list_off);
+      stbtt__buf_skip(&rl, 2); // RegionAxisCount
+      (void) stbtt__buf_get16(&rl); // RegionCount (validated via range above)
+   }
+   info->num_vsindices = var_data_count;
+   return var_data_count;
+}
+
 //////////////////////////////////////////////////////////////////////////
 //
 // accessors to parse data from file
@@ -1335,6 +1415,23 @@ static stbtt_uint32 stbtt__find_table(stbtt_uint8 *data, stbtt_uint32 fontstart,
    return 0;
 }
 
+// like stbtt__find_table, but also reports the table's declared length
+static stbtt_uint32 stbtt__find_table_len(stbtt_uint8 *data, stbtt_uint32 fontstart, const char *tag, stbtt_uint32 *length)
+{
+   stbtt_int32 num_tables = ttUSHORT(data+fontstart+4);
+   stbtt_uint32 tabledir = fontstart + 12;
+   stbtt_int32 i;
+   for (i=0; i < num_tables; ++i) {
+      stbtt_uint32 loc = tabledir + 16*i;
+      if (stbtt_tag(data+loc+0, tag)) {
+         if (length) *length = ttULONG(data+loc+12);
+         return ttULONG(data+loc+8);
+      }
+   }
+   if (length) *length = 0;
+   return 0;
+}
+
 static int stbtt_GetFontOffsetForIndex_internal(unsigned char *font_collection, int index)
 {
    // if it's just a font, there's only one valid index
@@ -1370,7 +1467,7 @@ static int stbtt_GetNumberOfFonts_internal(unsigned char *font_collection)
    return 0;
 }
 
-static stbtt__buf stbtt__get_subrs(stbtt__buf cff, stbtt__buf fontdict)
+static stbtt__buf stbtt__get_subrs(stbtt__buf cff, stbtt__buf fontdict, int cff2)
 {
    stbtt_uint32 subrsoff = 0, private_loc[2] = { 0, 0 };
    stbtt__buf pdict;
@@ -1379,8 +1476,9 @@ static stbtt__buf stbtt__get_subrs(stbtt__buf cff, stbtt__buf fontdict)
    pdict = stbtt__buf_range(&cff, private_loc[1], private_loc[0]);
    stbtt__dict_get_ints(&pdict, 19, 1, &subrsoff);
    if (!subrsoff) return stbtt__new_buf(NULL, 0);
+   if (private_loc[1] + subrsoff >= (stbtt_uint32) cff.size) return stbtt__new_buf(NULL, 0);
    stbtt__buf_seek(&cff, private_loc[1]+subrsoff);
-   return stbtt__cff_get_index(&cff);
+   return cff2 ? stbtt__cff2_get_index(&cff) : stbtt__cff_get_index(&cff);
 }
 
 // since most people won't use this, find this table the first time it's needed
@@ -1408,6 +1506,8 @@ static int stbtt_InitFont_internal(stbtt_fontinfo *info, unsigned char *data, in
    info->data = data;
    info->fontstart = fontstart;
    info->cff = stbtt__new_buf(NULL, 0);
+   info->cff2 = 0;
+   info->num_vsindices = 0;
 
    cmap = stbtt__find_table(data, fontstart, "cmap");       // required
    info->loca = stbtt__find_table(data, fontstart, "loca"); // required
@@ -1429,50 +1529,87 @@ static int stbtt_InitFont_internal(stbtt_fontinfo *info, unsigned char *data, in
       // initialization for CFF / Type2 fonts (OTF)
       stbtt__buf b, topdict, topdictidx;
       stbtt_uint32 cstype = 2, charstrings = 0, fdarrayoff = 0, fdselectoff = 0;
-      stbtt_uint32 cff;
+      stbtt_uint32 cff, cff_len = 0;
 
       cff = stbtt__find_table(data, fontstart, "CFF ");
+      if (!cff) {
+         cff = stbtt__find_table_len(data, fontstart, "CFF2", &cff_len);
+         if (cff) info->cff2 = 1;
+      }
       if (!cff) return 0;
 
       info->fontdicts = stbtt__new_buf(NULL, 0);
       info->fdselect = stbtt__new_buf(NULL, 0);
 
-      // @TODO this should use size from table (not 512MB)
-      info->cff = stbtt__new_buf(data+cff, 512*1024*1024);
+      // CFF2 is bounded by its table directory length; CFF keeps the legacy
+      // oversized buffer because its length field is not plumbed through.
+      info->cff = stbtt__new_buf(data+cff, info->cff2 ? (int) cff_len : 512*1024*1024);
       b = info->cff;
 
-      // read the header
-      stbtt__buf_skip(&b, 2);
-      stbtt__buf_seek(&b, stbtt__buf_get8(&b)); // hdrsize
+      if (info->cff2) {
+         if (b.size < 5) return 0;
+         {
+            int hdrsize = b.data[2];
+            int topdictlen = (b.data[3] << 8) | b.data[4];
+            if (hdrsize < 5 || hdrsize > b.size || topdictlen < 0 ||
+                hdrsize + topdictlen > b.size) return 0;
+            stbtt__buf_seek(&b, hdrsize);
+            topdict = stbtt__buf_range(&b, hdrsize, topdictlen);
+            stbtt__buf_seek(&b, hdrsize + topdictlen);
+         }
+         info->gsubrs = stbtt__cff2_get_index(&b);
+         {
+            stbtt_uint32 vstore_off = 0;
+         // CFF2 charstrings are always Type 2; the blend/vsindex operators
+         // are handled in stbtt__run_charstring by collapsing to the default
+         // instance. The VariationStore (Top DICT key 24) is parsed only far
+         // enough to learn each vsindex's region count.
+         stbtt__dict_get_ints(&topdict, 17, 1, &charstrings);
+         stbtt__dict_get_ints(&topdict, 0x100 | 36, 1, &fdarrayoff);
+         stbtt__dict_get_ints(&topdict, 0x100 | 37, 1, &fdselectoff);
+         stbtt__dict_get_ints(&topdict, 24, 1, &vstore_off);
+         info->subrs = stbtt__get_subrs(b, topdict, 1);
+         stbtt__cff2_parse_vstore(info, b, (int) vstore_off);
+         }
+      } else {
+         // read the header
+         stbtt__buf_skip(&b, 2);
+         stbtt__buf_seek(&b, stbtt__buf_get8(&b)); // hdrsize
 
-      // @TODO the name INDEX could list multiple fonts,
-      // but we just use the first one.
-      stbtt__cff_get_index(&b);  // name INDEX
-      topdictidx = stbtt__cff_get_index(&b);
-      topdict = stbtt__cff_index_get(topdictidx, 0);
-      stbtt__cff_get_index(&b);  // string INDEX
-      info->gsubrs = stbtt__cff_get_index(&b);
+         // @TODO the name INDEX could list multiple fonts,
+         // but we just use the first one.
+         stbtt__cff_get_index(&b);  // name INDEX
+         topdictidx = stbtt__cff_get_index(&b);
+         topdict = stbtt__cff_index_get(topdictidx, 0);
+         stbtt__cff_get_index(&b);  // string INDEX
+         info->gsubrs = stbtt__cff_get_index(&b);
 
-      stbtt__dict_get_ints(&topdict, 17, 1, &charstrings);
-      stbtt__dict_get_ints(&topdict, 0x100 | 6, 1, &cstype);
-      stbtt__dict_get_ints(&topdict, 0x100 | 36, 1, &fdarrayoff);
-      stbtt__dict_get_ints(&topdict, 0x100 | 37, 1, &fdselectoff);
-      info->subrs = stbtt__get_subrs(b, topdict);
+         stbtt__dict_get_ints(&topdict, 17, 1, &charstrings);
+         stbtt__dict_get_ints(&topdict, 0x100 | 6, 1, &cstype);
+         stbtt__dict_get_ints(&topdict, 0x100 | 36, 1, &fdarrayoff);
+         stbtt__dict_get_ints(&topdict, 0x100 | 37, 1, &fdselectoff);
+         info->subrs = stbtt__get_subrs(b, topdict, 0);
+      }
 
       // we only support Type 2 charstrings
       if (cstype != 2) return 0;
       if (charstrings == 0) return 0;
 
       if (fdarrayoff) {
-         // looks like a CID font
-         if (!fdselectoff) return 0;
+         // CFF requires an FDSelect for CID fonts; CFF2 may omit it, in which
+         // case every glyph maps to font dict 0.
+         if (!fdselectoff && !info->cff2) return 0;
+         if (info->cff2 && (fdarrayoff >= (stbtt_uint32) b.size ||
+                            (fdselectoff && fdselectoff >= (stbtt_uint32) b.size))) return 0;
          stbtt__buf_seek(&b, fdarrayoff);
-         info->fontdicts = stbtt__cff_get_index(&b);
-         info->fdselect = stbtt__buf_range(&b, fdselectoff, b.size-fdselectoff);
+         info->fontdicts = info->cff2 ? stbtt__cff2_get_index(&b) : stbtt__cff_get_index(&b);
+         if (fdselectoff)
+            info->fdselect = stbtt__buf_range(&b, fdselectoff, b.size-fdselectoff);
       }
 
+      if (info->cff2 && charstrings >= (stbtt_uint32) b.size) return 0;
       stbtt__buf_seek(&b, charstrings);
-      info->charstrings = stbtt__cff_get_index(&b);
+      info->charstrings = info->cff2 ? stbtt__cff2_get_index(&b) : stbtt__cff_get_index(&b);
    }
 
    t = stbtt__find_table(data, fontstart, "maxp");
@@ -2022,9 +2159,9 @@ static void stbtt__csctx_rccurve_to(stbtt__csctx *ctx, float dx1, float dy1, flo
    stbtt__csctx_v(ctx, STBTT_vcubic, (int)ctx->x, (int)ctx->y, (int)cx1, (int)cy1, (int)cx2, (int)cy2);
 }
 
-static stbtt__buf stbtt__get_subr(stbtt__buf idx, int n)
+static stbtt__buf stbtt__get_subr(stbtt__buf idx, int n, int cff2)
 {
-   int count = stbtt__cff_index_count(&idx);
+   int count = cff2 ? stbtt__cff2_index_count(&idx) : stbtt__cff_index_count(&idx);
    int bias = 107;
    if (count >= 33900)
       bias = 32768;
@@ -2033,7 +2170,7 @@ static stbtt__buf stbtt__get_subr(stbtt__buf idx, int n)
    n += bias;
    if (n < 0 || n >= count)
       return stbtt__new_buf(NULL, 0);
-   return stbtt__cff_index_get(idx, n);
+   return cff2 ? stbtt__cff2_index_get(idx, n) : stbtt__cff_index_get(idx, n);
 }
 
 static stbtt__buf stbtt__cid_get_glyph_subrs(const stbtt_fontinfo *info, int glyph_index)
@@ -2059,14 +2196,30 @@ static stbtt__buf stbtt__cid_get_glyph_subrs(const stbtt_fontinfo *info, int gly
          }
          start = end;
       }
+   } else if (fmt == 4) {
+      // CFF2 only: Card32 GIDs and Card16 FD indices
+      nranges = (int) stbtt__buf_get32(&fdselect);
+      start = (int) stbtt__buf_get32(&fdselect);
+      for (i = 0; i < nranges; i++) {
+         v = stbtt__buf_get16(&fdselect);
+         end = (int) stbtt__buf_get32(&fdselect);
+         if (glyph_index >= start && glyph_index < end) {
+            fdselector = v;
+            break;
+         }
+         start = end;
+      }
    }
    if (fdselector == -1) return stbtt__new_buf(NULL, 0);
-   return stbtt__get_subrs(info->cff, stbtt__cff_index_get(info->fontdicts, fdselector));
+   return stbtt__get_subrs(info->cff,
+      info->cff2 ? stbtt__cff2_index_get(info->fontdicts, fdselector)
+                 : stbtt__cff_index_get(info->fontdicts, fdselector), info->cff2);
 }
 
 static int stbtt__run_charstring(const stbtt_fontinfo *info, int glyph_index, stbtt__csctx *c)
 {
    int in_header = 1, maskbits = 0, subr_stack_height = 0, sp = 0, v, i, b0;
+   int cur_vsindex = 0;
    int has_subrs = 0, clear_stack;
    float s[48];
    stbtt__buf subr_stack[10], subrs = info->subrs, b;
@@ -2075,7 +2228,8 @@ static int stbtt__run_charstring(const stbtt_fontinfo *info, int glyph_index, st
 #define STBTT__CSERR(s) (0)
 
    // this currently ignores the initial width value, which isn't needed if we have hmtx
-   b = stbtt__cff_index_get(info->charstrings, glyph_index);
+   b = info->cff2 ? stbtt__cff2_index_get(info->charstrings, glyph_index)
+                  : stbtt__cff_index_get(info->charstrings, glyph_index);
    while (b.cursor < b.size) {
       i = 0;
       clear_stack = 1;
@@ -2202,7 +2356,7 @@ static int stbtt__run_charstring(const stbtt_fontinfo *info, int glyph_index, st
          v = (int) s[--sp];
          if (subr_stack_height >= 10) return STBTT__CSERR("recursion limit");
          subr_stack[subr_stack_height++] = b;
-         b = stbtt__get_subr(b0 == 0x0A ? subrs : info->gsubrs, v);
+         b = stbtt__get_subr(b0 == 0x0A ? subrs : info->gsubrs, v, info->cff2);
          if (b.size == 0) return STBTT__CSERR("subr not found");
          b.cursor = 0;
          clear_stack = 0;
@@ -2213,6 +2367,37 @@ static int stbtt__run_charstring(const stbtt_fontinfo *info, int glyph_index, st
          b = subr_stack[--subr_stack_height];
          clear_stack = 0;
          break;
+
+      case 0x0F: // vsindex (CFF2)
+         // select the active variation store; the region count of that store
+         // is looked up when a blend follows. No deltas apply at the default.
+         if (sp < 1) return STBTT__CSERR("vsindex stack");
+         cur_vsindex = (int) s[sp - 1];
+         if (cur_vsindex < 0 || cur_vsindex >= info->num_vsindices) return STBTT__CSERR("bad vsindex");
+         sp--;
+         break;
+
+      case 0x10: { // blend (CFF2)
+         // CFF2 blend stack (depth n*(k+1)+1):
+         //   <n base args> <n*k delta args, grouped by region> n
+         // n (on top) is the number of blended operands and k the region count
+         // of the active vsindex, parsed from the VariationStore. Only the top
+         // n*(k+1)+1 entries belong to the blend; entries below it stay on the
+         // stack. At the default instance every delta is zero, so collapse the
+         // blend to its n leading base arguments.
+         int n, k, base;
+         if (sp < 1) return STBTT__CSERR("blend stack");
+         n = (int) s[sp - 1];
+         if (n <= 0) return STBTT__CSERR("blend stack");
+         k = cur_vsindex < info->num_vsindices ? info->region_counts[cur_vsindex] : 0;
+         if (sp < n * (k + 1) + 1) return STBTT__CSERR("blend stack");
+         base = sp - (n * (k + 1) + 1);
+         // the n base args already lead the blend region at s[base..base+n)
+         sp = base + n;
+         // the surviving base arguments feed the following path operator
+         clear_stack = 0;
+         break;
+      }
 
       case 0x0E: // endchar
          stbtt__csctx_close_shape(c);
@@ -2317,6 +2502,12 @@ static int stbtt__run_charstring(const stbtt_fontinfo *info, int glyph_index, st
          break;
       }
       if (clear_stack) sp = 0;
+   }
+   // CFF2 charstrings omit endchar: reaching the end of the byte string
+   // terminates the glyph. CFF still requires an explicit endchar.
+   if (info->cff2) {
+      stbtt__csctx_close_shape(c);
+      return 1;
    }
    return STBTT__CSERR("no endchar");
 
