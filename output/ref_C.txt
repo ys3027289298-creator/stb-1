@@ -1,0 +1,7 @@
+A V 0
+V A 0
+T o 0
+W a 0
+A W 0
+o o 0
+A A 0

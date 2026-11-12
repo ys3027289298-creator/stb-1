@@ -2377,43 +2377,61 @@ STBTT_DEF void stbtt_GetGlyphVMetrics(const stbtt_fontinfo *info, int glyph_inde
    if (topSideBearing)  *topSideBearing   = ttSHORT(info->data + info->vmtx + 4*glyph_index + 2);
 }
 
-STBTT_DEF int  stbtt_GetKerningTableLength(const stbtt_fontinfo *info)
+// The 'kern' table comes in two layouts: the OpenType one (16-bit version 0,
+// 16-bit nTables) and Apple's version 0 (32-bit version 0, 32-bit nTables,
+// subtables with 32-bit length). Both store format-0 pairs identically, so
+// dispatch on the table version and return where the pairs live.
+static stbtt_uint8 *stbtt__kern_format0_pairs(const stbtt_fontinfo *info, int *count)
 {
    stbtt_uint8 *data = info->data + info->kern;
+   stbtt_uint16 coverage;
 
    // we only look at the first table. it must be 'horizontal' and format 0.
    if (!info->kern)
-      return 0;
-   if (ttUSHORT(data+2) < 1) // number of tables, need at least 1
-      return 0;
-   if (ttUSHORT(data+8) != 1) // horizontal flag must be set in format
-      return 0;
+      return NULL;
 
-   return ttUSHORT(data+10);
+   if (ttULONG(data+0) == 0) { // Apple 'kern' table, version 0
+      if (ttULONG(data+4) < 1) // number of tables, need at least 1
+         return NULL;
+      coverage = ttUSHORT(data+12); // low byte is the format, high bits are flags
+      if ((coverage & 0xff) != 0 || (coverage & 0x8000)) // format 0, horizontal
+         return NULL;
+      *count = ttUSHORT(data+16);
+      return data + 24;
+   }
+
+   // OpenType 'kern' table
+   if (ttUSHORT(data+2) < 1) // number of tables, need at least 1
+      return NULL;
+   if (ttUSHORT(data+8) != 1) // horizontal flag must be set in format
+      return NULL;
+   *count = ttUSHORT(data+10);
+   return data + 18;
+}
+
+STBTT_DEF int  stbtt_GetKerningTableLength(const stbtt_fontinfo *info)
+{
+   int count;
+   return stbtt__kern_format0_pairs(info, &count) ? count : 0;
 }
 
 STBTT_DEF int stbtt_GetKerningTable(const stbtt_fontinfo *info, stbtt_kerningentry* table, int table_length)
 {
-   stbtt_uint8 *data = info->data + info->kern;
+   stbtt_uint8 *pairs;
    int k, length;
 
-   // we only look at the first table. it must be 'horizontal' and format 0.
-   if (!info->kern)
-      return 0;
-   if (ttUSHORT(data+2) < 1) // number of tables, need at least 1
-      return 0;
-   if (ttUSHORT(data+8) != 1) // horizontal flag must be set in format
+   pairs = stbtt__kern_format0_pairs(info, &length);
+   if (!pairs)
       return 0;
 
-   length = ttUSHORT(data+10);
    if (table_length < length)
       length = table_length;
 
    for (k = 0; k < length; k++)
    {
-      table[k].glyph1 = ttUSHORT(data+18+(k*6));
-      table[k].glyph2 = ttUSHORT(data+20+(k*6));
-      table[k].advance = ttSHORT(data+22+(k*6));
+      table[k].glyph1 = ttUSHORT(pairs+0+(k*6));
+      table[k].glyph2 = ttUSHORT(pairs+2+(k*6));
+      table[k].advance = ttSHORT(pairs+4+(k*6));
    }
 
    return length;
@@ -2421,30 +2439,26 @@ STBTT_DEF int stbtt_GetKerningTable(const stbtt_fontinfo *info, stbtt_kerningent
 
 static int stbtt__GetGlyphKernInfoAdvance(const stbtt_fontinfo *info, int glyph1, int glyph2)
 {
-   stbtt_uint8 *data = info->data + info->kern;
+   stbtt_uint8 *pairs;
    stbtt_uint32 needle, straw;
-   int l, r, m;
+   int l, r, m, count;
 
-   // we only look at the first table. it must be 'horizontal' and format 0.
-   if (!info->kern)
-      return 0;
-   if (ttUSHORT(data+2) < 1) // number of tables, need at least 1
-      return 0;
-   if (ttUSHORT(data+8) != 1) // horizontal flag must be set in format
+   pairs = stbtt__kern_format0_pairs(info, &count);
+   if (!pairs)
       return 0;
 
    l = 0;
-   r = ttUSHORT(data+10) - 1;
+   r = count - 1;
    needle = glyph1 << 16 | glyph2;
    while (l <= r) {
       m = (l + r) >> 1;
-      straw = ttULONG(data+18+(m*6)); // note: unaligned read
+      straw = ttULONG(pairs+(m*6)); // note: unaligned read
       if (needle < straw)
          r = m - 1;
       else if (needle > straw)
          l = m + 1;
       else
-         return ttSHORT(data+22+(m*6));
+         return ttSHORT(pairs+4+(m*6));
    }
    return 0;
 }

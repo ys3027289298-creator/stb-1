@@ -1,0 +1,9 @@
+# sample pairs for font B: left right kern (kern 0 = not embedded, expect 0)
+L T -70
+T A -55
+Y o -45
+o w -20
+w o -18
+P a -35
+r n -10
+n r 0
