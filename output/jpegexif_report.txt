@@ -1,0 +1,13 @@
+small_exif      segment=yes written=64    readback=64    bytes_match=yes stb_load=ok
+near_limit_exif segment=yes written=65527 readback=65527 bytes_match=yes stb_load=ok
+empty_exif      segment=no  written=0     readback=0     bytes_match=yes stb_load=ok
+no_exif         segment=no  written=0     readback=0     bytes_match=yes stb_load=ok
+over_limit      over_limit_write=no (expect no)
+no_exif_compat  identical=yes
+file_entry      file_api_write=ok file_api_over_limit=no(expect)
+with_exif(NULL,0) vs stbi_write_jpg: byte-identical
+small_exif      pillow_open=ok pillow_exif=Exif app1_bytes=64
+near_limit_exif pillow_open=ok pillow_exif=Exif app1_bytes=65527
+empty_exif      pillow_open=ok pillow_exif=Exif app1_bytes=0
+no_exif         pillow_open=ok pillow_exif=Exif app1_bytes=0
+file_api        pillow_open=ok pillow_exif=Exif app1_bytes=64

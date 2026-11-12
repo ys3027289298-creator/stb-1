@@ -60,6 +60,14 @@ USAGE:
      int stbi_write_jpg_strided(char const *filename, int w, int h, int comp, const void *data, ptrdiff_t stride_in_bytes, int quality);
      int stbi_write_hdr_strided(char const *filename, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
 
+   To preserve camera EXIF (e.g. GPS location/orientation) when writing a JPEG,
+   pass the raw EXIF payload (without the APP1 marker and length field) to:
+
+     int stbi_write_jpg_strided_with_exif(char const *filename, int w, int h, int comp, const void *data, ptrdiff_t stride_in_bytes, int quality, const void *exif, int exif_len);
+
+   or the matching stbi_write_jpg_strided_to_func_with_exif() callback variant.
+   It returns 0 when the resulting APP1 segment would exceed 65535 bytes.
+
    There are also five equivalent functions that use an arbitrary write function. You are
    expected to open/close your file-equivalent before and after calling these:
 
@@ -205,6 +213,13 @@ STBIWDEF int stbi_write_tga_strided(char const *filename, int w, int h, int comp
 STBIWDEF int stbi_write_hdr_strided(char const *filename, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_jpg_strided(char const *filename, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
 
+// JPEG writer that preserves the caller's raw EXIF payload (the bytes that
+// normally follow the "Exif\0\0" identifier), embedding it as an APP1
+// segment immediately after SOI. Returns 0 if the EXIF would make the APP1
+// segment longer than 65535 bytes (i.e. exif_len > 65527). A NULL/zero
+// exif argument produces byte-identical output to stbi_write_jpg_strided.
+STBIWDEF int stbi_write_jpg_strided_with_exif(char const *filename, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality, const void *exif, int exif_len);
+
 #ifdef STBIW_WINDOWS_UTF8
 STBIWDEF int stbiw_convert_wchar_to_utf8(char *buffer, size_t bufferlen, const wchar_t* input);
 #endif
@@ -222,6 +237,8 @@ STBIWDEF int stbi_write_bmp_strided_to_func(stbi_write_func *func, void *context
 STBIWDEF int stbi_write_tga_strided_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_hdr_strided_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
+
+STBIWDEF int stbi_write_jpg_strided_to_func_with_exif(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality, const void *exif, int exif_len);
 
 STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
 
@@ -378,7 +395,7 @@ static int stbi__start_write_file(stbi__write_context *s, const char *filename)
 
 static int stbi__end_write_file(stbi__write_context *s, int result)
 {
-   if (fclose((FILE *)s->context) != 0)
+   if (fclose((FILE *)s->file_maybe) != 0)
        s->ok = 0;
    return s->ok ? result : 0;
 }
@@ -1580,7 +1597,7 @@ static int stbiw__jpg_processDU(stbi__write_context *s, unsigned int *bitBuf, in
    return DU[0];
 }
 
-static int stbi_write_jpg_core(stbi__write_context *s, int width, int height, int comp, const void* data, int quality, ptrdiff_t stride_in_bytes) {
+static int stbi_write_jpg_core(stbi__write_context *s, int width, int height, int comp, const void* data, int quality, ptrdiff_t stride_in_bytes, const void *exif, int exif_len) {
    // Constants that don't pollute global namespace
    static const unsigned char std_dc_luminance_nrcodes[] = {0,0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0};
    static const unsigned char std_dc_luminance_values[] = {0,1,2,3,4,5,6,7,8,9,10,11};
@@ -1660,6 +1677,15 @@ static int stbi_write_jpg_core(stbi__write_context *s, int width, int height, in
       return 0;
    }
 
+   // APP1 is marker(2) + length field(2) + "Exif\0\0"(6) + payload; the length
+   // field itself is included in the value, so the payload must fit in 65535-8.
+   if (exif_len < 0 || (exif != NULL && exif_len > 65535 - 8)) {
+      return 0;
+   }
+   if (exif_len > 0 && exif == NULL) {
+      return 0;
+   }
+
    if (stride_in_bytes == 0)
       stride_in_bytes = comp*width;
 
@@ -1684,10 +1710,20 @@ static int stbi_write_jpg_core(stbi__write_context *s, int width, int height, in
 
    // Write Headers
    {
-      static const unsigned char head0[] = { 0xFF,0xD8,0xFF,0xE0,0,0x10,'J','F','I','F',0,1,1,0,0,1,0,1,0,0,0xFF,0xDB,0,0x84,0 };
+      static const unsigned char soi[] = { 0xFF,0xD8 };
+      static const unsigned char head0[] = { 0xFF,0xE0,0,0x10,'J','F','I','F',0,1,1,0,0,1,0,1,0,0,0xFF,0xDB,0,0x84,0 };
       static const unsigned char head2[] = { 0xFF,0xDA,0,0xC,3,1,0,2,0x11,3,0x11,0,0x3F,0 };
       const unsigned char head1[] = { 0xFF,0xC0,0,0x11,8,(unsigned char)(height>>8),STBIW_UCHAR(height),(unsigned char)(width>>8),STBIW_UCHAR(width),
                                       3,1,(unsigned char)(subsample?0x22:0x11),0,2,0x11,1,3,0x11,1,0xFF,0xC4,0x01,0xA2,0 };
+      static const unsigned char exif_tag[] = { 'E','x','i','f',0,0 };
+      s->func(s->context, (void*)soi, sizeof(soi));
+      if (exif_len > 0) {
+         int app1_len = exif_len + (int) sizeof(exif_tag) + 2;
+         unsigned char app1_head[4] = { 0xFF,0xE1,(unsigned char)(app1_len>>8),(unsigned char)(app1_len&0xFF) };
+         s->func(s->context, app1_head, sizeof(app1_head));
+         s->func(s->context, (void*)exif_tag, sizeof(exif_tag));
+         s->func(s->context, (void*)exif, exif_len);
+      }
       s->func(s->context, (void*)head0, sizeof(head0));
       s->func(s->context, (void*)YTable, sizeof(YTable));
       stbiw__putc(s, 1);
@@ -1798,12 +1834,20 @@ STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context
    stbi__write_context s;
    memset(&s, 0, sizeof(s));
    stbi__start_write_callbacks(&s, func, context);
-   return stbi_write_jpg_core(&s, x, y, comp, (void *) data, quality, stride_in_bytes);
+   return stbi_write_jpg_core(&s, x, y, comp, (void *) data, quality, stride_in_bytes, NULL, 0);
 }
 
 STBIWDEF int stbi_write_jpg_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void *data, int quality)
 {
    return stbi_write_jpg_strided_to_func(func, context, x, y, comp, data, 0, quality);
+}
+
+STBIWDEF int stbi_write_jpg_strided_to_func_with_exif(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality, const void *exif, int exif_len)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   stbi__start_write_callbacks(&s, func, context);
+   return stbi_write_jpg_core(&s, x, y, comp, (void *) data, quality, stride_in_bytes, exif, exif_len);
 }
 
 #ifndef STBI_WRITE_NO_STDIO
@@ -1812,7 +1856,7 @@ STBIWDEF int stbi_write_jpg_strided(char const *filename, int x, int y, int comp
    stbi__write_context s;
    memset(&s, 0, sizeof(s));
    if (stbi__start_write_file(&s,filename)) {
-      int r = stbi_write_jpg_core(&s, x, y, comp, data, quality, stride_in_bytes);
+      int r = stbi_write_jpg_core(&s, x, y, comp, data, quality, stride_in_bytes, NULL, 0);
       return stbi__end_write_file(&s, r);
    } else
       return 0;
@@ -1821,6 +1865,17 @@ STBIWDEF int stbi_write_jpg_strided(char const *filename, int x, int y, int comp
 STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const void *data, int quality)
 {
    return stbi_write_jpg_strided(filename, x, y, comp, data, 0, quality);
+}
+
+STBIWDEF int stbi_write_jpg_strided_with_exif(char const *filename, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality, const void *exif, int exif_len)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   if (stbi__start_write_file(&s,filename)) {
+      int r = stbi_write_jpg_core(&s, x, y, comp, data, quality, stride_in_bytes, exif, exif_len);
+      return stbi__end_write_file(&s, r);
+   } else
+      return 0;
 }
 #endif
 
