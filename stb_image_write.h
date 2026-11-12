@@ -52,6 +52,16 @@ USAGE:
 
      void stbi_flip_vertically_on_write(int flag); // flag is non-zero to flip data vertically
 
+   PNG color space chunks (written after IHDR, before any other data chunk):
+
+     void stbi_write_png_srgb(int enable);       // non-zero: write an sRGB chunk,
+                                                 // rendering intent = relative colorimetric
+     void stbi_write_png_gamma(float gamma);     // gamma > 0: write a gAMA chunk whose
+                                                 // value is round(100000 / gamma); 0: none
+
+   Both default to off, in which case no color chunks are written and output
+   is unchanged. If sRGB is enabled it takes precedence over the gAMA setting.
+
    In addition there are four more functions which accept the "ptrdiff_t stride_in_bytes" argument, new functions for
    backwards compatibility:
 
@@ -117,6 +127,13 @@ USAGE:
 
    PNG allows you to set the deflate compression level by setting the global
    variable 'stbi_write_png_compression_level' (it defaults to 8).
+
+   PNG color space metadata is off by default, and leaving it off keeps the
+   output byte-identical to older versions. Call stbi_write_png_srgb(1) to
+   write an sRGB chunk (relative colorimetric intent), or stbi_write_png_gamma()
+   with a positive gamma to write a gAMA chunk containing round(100000/gamma).
+   Both chunks are placed immediately after IHDR and before all other chunks;
+   sRGB takes precedence when both are requested.
 
    HDR expects linear float data. Since the format is always 32-bit rgb(e)
    data, alpha (if provided) is discarded, and for monochrome data it is
@@ -224,6 +241,8 @@ STBIWDEF int stbi_write_hdr_strided_to_func(stbi_write_func *func, void *context
 STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
 
 STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
+STBIWDEF void stbi_write_png_srgb(int enable);
+STBIWDEF void stbi_write_png_gamma(float gamma);
 
 #endif//INCLUDE_STB_IMAGE_WRITE_H
 
@@ -295,6 +314,19 @@ static int stbi__flip_vertically_on_write = 0;
 STBIWDEF void stbi_flip_vertically_on_write(int flag)
 {
    stbi__flip_vertically_on_write = flag;
+}
+
+static int stbi__write_png_srgb = 0;
+static float stbi__write_png_gamma = 0.0f;
+
+STBIWDEF void stbi_write_png_srgb(int enable)
+{
+   stbi__write_png_srgb = enable != 0;
+}
+
+STBIWDEF void stbi_write_png_gamma(float gamma)
+{
+   stbi__write_png_gamma = gamma > 0.0f ? gamma : 0.0f;
 }
 
 typedef struct
@@ -1361,10 +1393,18 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    STBIW_FREE(filt);
    if (!zlib) return 0;
 
+   // optional sRGB/gAMA color chunks, each written as length+tag+data+crc
+   int has_srgb = stbi__write_png_srgb;
+   int has_gama = !has_srgb && stbi__write_png_gamma > 0.0f;
+   int color_len = has_srgb ? 13 : (has_gama ? 16 : 0);
+   unsigned int gama_value = has_gama
+      ? (unsigned int) (100000.0f / stbi__write_png_gamma + 0.5f)
+      : 0;
+
    // each tag requires 12 bytes of overhead
-   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + 12+zlen + 12);
+   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + color_len + 12+zlen + 12);
    if (!out) return 0;
-   *out_len = 8 + 12+13 + 12+zlen + 12;
+   *out_len = 8 + 12+13 + color_len + 12+zlen + 12;
 
    o=out;
    STBIW_MEMMOVE(o,sig,8); o+= 8;
@@ -1378,6 +1418,19 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    *o++ = 0;
    *o++ = 0;
    stbiw__wpcrc(&o,13);
+
+   if (has_srgb) {
+      stbiw__wp32(o, 1);                 // data length
+      stbiw__wptag(o, "sRGB");
+      *o++ = 0;                          // rendering intent: relative colorimetric
+      stbiw__wpcrc(&o, 1);
+   }
+   if (has_gama) {
+      stbiw__wp32(o, 4);                 // data length
+      stbiw__wptag(o, "gAMA");
+      stbiw__wp32(o, gama_value);        // gamma encoded as 100000/gamma
+      stbiw__wpcrc(&o, 4);
+   }
 
    stbiw__wp32(o, zlen);
    stbiw__wptag(o, "IDAT");
