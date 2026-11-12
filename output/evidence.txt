@@ -1,0 +1,51 @@
+===== 验证时间: 2026-11-12 13:24:56Z =====
+
+## 1. 运行输出（帧数/延时/中心像素/角点像素/单帧一致性）
+== tests/gifanim/two_frame.gif ==
+frames=2 size=5x5 comp=4
+  frame 0: delay_ms=100 center_rgba=(255,0,0,255)
+           corner_rgba=(255,255,255,255)
+  frame 1: delay_ms=250 center_rgba=(0,200,0,255)
+           corner_rgba=(255,255,255,255)
+== tests/gifanim/transparent.gif ==
+frames=2 size=5x5 comp=4
+  frame 0: delay_ms=150 center_rgba=(255,0,0,255)
+           corner_rgba=(0,0,0,0)
+  frame 1: delay_ms=300 center_rgba=(0,200,0,255)
+           corner_rgba=(0,0,0,0)
+== tests/gifanim/dispose2.gif ==
+frames=3 size=5x5 comp=4
+  frame 0: delay_ms=200 center_rgba=(255,0,0,255)
+           corner_rgba=(255,255,255,255)
+  frame 1: delay_ms=400 center_rgba=(0,200,0,255)
+           corner_rgba=(255,255,255,255)
+  frame 2: delay_ms=600 center_rgba=(255,0,0,255)
+           corner_rgba=(0,0,255,255)
+== tests/gifanim/single.gif ==
+frames=1 size=5x5 comp=4
+  frame 0: delay_ms=500 center_rgba=(0,0,255,255)
+           corner_rgba=(255,255,255,255)
+  single-frame vs stbi_load_from_memory: IDENTICAL (mismatches=0)
+
+## 2. 需求覆盖 -> stb_image.h 现有实现定位
+472:STBIDEF stbi_uc *stbi_load_gif_from_memory(stbi_uc const *buffer, int len, int **delays, int *x, int *y, int *z, int *comp, int req_comp);
+1501:STBIDEF stbi_uc *stbi_load_gif_from_memory(stbi_uc const *buffer, int len, int **delays, int *x, int *y, int *z, int *comp, int req_comp)
+-- GCE 解析（处置方式 eflags/延时 delay/透明索引 transparent）:
+6586:      dispose = (g->eflags & 0x1C) >> 2;
+6673:            if (ext == 0xF9) { // Graphic Control Extension.
+6677:                  g->delay = 10 * stbi__get16le(s); // delay - 1/100th of a second, saving as 1/1000ths.
+6679:                  g->transparent = stbi__get8(s);
+-- 帧间合成（dispose=1 保留 / dispose=2 恢复背景 / dispose=3 恢复前一帧）:
+6587:      if ((dispose == 3) && !saved) {
+6591:      if (dispose == 3) { // use previous graphic
+6595:      } else if (dispose == 2) { // use background color
+6607:         // This is a non-disposal case either way, just leave the pixels as they are.
+-- 老单帧接口与新接口共用解码核心:
+6737:      stbi_uc *pixels = stbi__gif_load_next(s, g, comp, req_comp, saved_pixels);
+6834:   u = stbi__gif_load_next(s, g, comp, req_comp, 0);
+-- STBI_rgb_alpha 定义:
+408:   STBI_rgb_alpha  = 4
+
+## 3. 编译/ASan 结果
+gcc -Wall -Wextra 编译: 0 警告
+ASan+UBSan 运行四个 GIF: exit=0，无报错

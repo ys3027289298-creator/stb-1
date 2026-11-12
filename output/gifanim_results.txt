@@ -1,0 +1,25 @@
+== tests/gifanim/two_frame.gif ==
+frames=2 size=5x5 comp=4
+  frame 0: delay_ms=100 center_rgba=(255,0,0,255)
+           corner_rgba=(255,255,255,255)
+  frame 1: delay_ms=250 center_rgba=(0,200,0,255)
+           corner_rgba=(255,255,255,255)
+== tests/gifanim/transparent.gif ==
+frames=2 size=5x5 comp=4
+  frame 0: delay_ms=150 center_rgba=(255,0,0,255)
+           corner_rgba=(0,0,0,0)
+  frame 1: delay_ms=300 center_rgba=(0,200,0,255)
+           corner_rgba=(0,0,0,0)
+== tests/gifanim/dispose2.gif ==
+frames=3 size=5x5 comp=4
+  frame 0: delay_ms=200 center_rgba=(255,0,0,255)
+           corner_rgba=(255,255,255,255)
+  frame 1: delay_ms=400 center_rgba=(0,200,0,255)
+           corner_rgba=(255,255,255,255)
+  frame 2: delay_ms=600 center_rgba=(255,0,0,255)
+           corner_rgba=(0,0,255,255)
+== tests/gifanim/single.gif ==
+frames=1 size=5x5 comp=4
+  frame 0: delay_ms=500 center_rgba=(0,0,255,255)
+           corner_rgba=(255,255,255,255)
+  single-frame vs stbi_load_from_memory: IDENTICAL (mismatches=0)
