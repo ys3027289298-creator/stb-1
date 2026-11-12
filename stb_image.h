@@ -5409,7 +5409,7 @@ static int stbi__bmp_test_raw(stbi__context *s)
    stbi__get16le(s); // discard reserved
    stbi__get32le(s); // discard data offset
    sz = stbi__get32le(s);
-   r = (sz == 12 || sz == 40 || sz == 56 || sz == 108 || sz == 124);
+   r = (sz == 12 || sz == 40 || sz == 56 || sz == 64 || sz == 108 || sz == 124);
    return r;
 }
 
@@ -5472,6 +5472,8 @@ typedef struct
    int bpp, offset, hsz;
    unsigned int mr,mg,mb,ma, all_a;
    int extra_read;
+   int os2;       // OS/2 BITMAPCOREHEADER (12 bytes) or BITMAPCOREHEADER2 (64 bytes)
+   int compress;  // compression field (OS/2 encoding for os2 headers, Windows encoding otherwise)
 } stbi__bmp_data;
 
 static int stbi__bmp_set_mask_defaults(stbi__bmp_data *info, int compress)
@@ -5515,18 +5517,64 @@ static void *stbi__bmp_parse_header(stbi__context *s, stbi__bmp_data *info)
 
    if (info->offset < 0) return stbi__errpuc("bad BMP", "bad BMP");
 
-   if (hsz != 12 && hsz != 40 && hsz != 56 && hsz != 108 && hsz != 124) return stbi__errpuc("unknown BMP", "BMP type not supported: unknown");
-   if (hsz == 12) {
+   if (hsz != 12 && hsz != 40 && hsz != 56 && hsz != 64 && hsz != 108 && hsz != 124) return stbi__errpuc("unknown BMP", "BMP type not supported: unknown");
+   info->os2 = (hsz == 12 || hsz == 64);
+   info->compress = 0;
+   if (hsz == 12) { // OS/2 1.x BITMAPCOREHEADER: 16-bit dimensions
       s->img_x = stbi__get16le(s);
       s->img_y = stbi__get16le(s);
+   } else if (hsz == 64) { // OS/2 2.x BITMAPCOREHEADER2: 32-bit dimensions
+      s->img_x = stbi__get32le(s);
+      s->img_y = stbi__get32le(s);
    } else {
       s->img_x = stbi__get32le(s);
       s->img_y = stbi__get32le(s);
    }
    if (stbi__get16le(s) != 1) return stbi__errpuc("bad BMP", "bad BMP");
    info->bpp = stbi__get16le(s);
-   if (hsz != 12) {
+   if (info->os2) {
+      // OS/2 headers: 12-byte BITMAPCOREHEADER (1.x) has no compression field,
+      // 64-byte BITMAPCOREHEADER2 (2.x) stores a 32-bit compression field here
+      if (hsz == 64) {
+         info->compress = stbi__get32le(s);
+         // OS/2 encodings: 0=uncompressed, 1=RLE8, 2=RLE4, 3=RLE24, 4=Huffman 1D
+         if (info->compress == 4)
+            return stbi__errpuc("OS/2 Huffman", "BMP type not supported: OS/2 Huffman 1D compression");
+         if (info->compress > 4)
+            return stbi__errpuc("OS/2 bad compression", "Corrupt BMP");
+         if (info->compress == 2 && info->bpp != 4)
+            return stbi__errpuc("OS/2 bad compression", "Corrupt BMP");
+         if (info->compress == 1 && info->bpp != 8)
+            return stbi__errpuc("OS/2 bad compression", "Corrupt BMP");
+         if (info->compress == 3 && info->bpp != 24)
+            return stbi__errpuc("OS/2 bad compression", "Corrupt BMP");
+      }
+      // OS/2 bit depths are limited to 1, 4, 8 or 24
+      if (info->bpp != 1 && info->bpp != 4 && info->bpp != 8 && info->bpp != 24)
+         return stbi__errpuc("OS/2 bad bpp", "Corrupt BMP");
+      if (s->img_x <= 0 || s->img_y == 0)
+         return stbi__errpuc("bad BMP", "bad BMP");
+      if (hsz == 64) {
+         // rest of BITMAPCOREHEADER2: 32-bit fields, then four 16-bit fields,
+         // then four more 32-bit fields (12*4 + 4*2 = 56, plus 8 bytes for
+         // the dimensions already consumed above => 64 total)
+         stbi__get32le(s); // discard image size
+         stbi__get32le(s); // discard x resolution
+         stbi__get32le(s); // discard y resolution
+         stbi__get32le(s); // discard colors used
+         stbi__get32le(s); // discard colors important
+         stbi__get16le(s); // discard resolution units
+         stbi__get16le(s); // discard reserved
+         stbi__get16le(s); // discard recording
+         stbi__get16le(s); // discard halftoning
+         stbi__get32le(s); // discard halftone size 1
+         stbi__get32le(s); // discard halftone size 2
+         stbi__get32le(s); // discard color encoding
+         stbi__get32le(s); // discard identifier
+      }
+   } else {
       int compress = stbi__get32le(s);
+      info->compress = compress;
       if (compress == 1 || compress == 2) return stbi__errpuc("BMP RLE", "BMP type not supported: RLE");
       if (compress >= 4) return stbi__errpuc("BMP JPEG/PNG", "BMP type not supported: unsupported compression"); // this includes PNG/JPEG modes
       if (compress == 3 && info->bpp != 16 && info->bpp != 32) return stbi__errpuc("bad BMP", "bad BMP"); // bitfields requires 16 or 32 bits/pixel
@@ -5580,6 +5628,93 @@ static void *stbi__bmp_parse_header(stbi__context *s, stbi__bmp_data *info)
 }
 
 
+// write one pixel into the (unflipped, bottom-up) output buffer
+static void stbi__bmp_os2_put_pixel(stbi_uc *out, int target, int width, int height,
+                                    int x, int y, stbi_uc r, stbi_uc g, stbi_uc b)
+{
+   stbi_uc *dst;
+   if (x < 0 || x >= width || y < 0 || y >= height) return;
+   dst = out + (y * width + x) * target;
+   dst[0] = r; dst[1] = g; dst[2] = b;
+   if (target == 4) dst[3] = 255;
+}
+
+// decode an OS/2 RLE8/RLE4/RLE24 bitmap directly into the (unflipped, bottom-up)
+// output buffer in the same RGB[A] layout as the uncompressed BMP paths
+static int stbi__bmp_os2_decode_rle(stbi__context *s, stbi__bmp_data *info, stbi_uc *out,
+                                    int target, stbi_uc pal[256][4])
+{
+   int x = 0, y = 0;
+   int width  = (int) s->img_x;
+   int height = (int) s->img_y;
+
+   while (!stbi__at_eof(s)) {
+      int count = stbi__get8(s);
+      int tag   = stbi__get8(s);
+      if (count > 0) {
+         // encoded run
+         int k;
+         if (info->compress == 1) { // RLE8
+            int idx = tag;
+            for (k = 0; k < count; ++k)
+               stbi__bmp_os2_put_pixel(out, target, width, height, x++, y, pal[idx][0], pal[idx][1], pal[idx][2]);
+         } else if (info->compress == 2) { // RLE4
+            int hi = 1;
+            int nib = tag >> 4;
+            for (k = 0; k < count; ++k) {
+               stbi__bmp_os2_put_pixel(out, target, width, height, x++, y, pal[nib][0], pal[nib][1], pal[nib][2]);
+               hi = !hi;
+               nib = hi ? tag >> 4 : tag & 15;
+            }
+         } else { // RLE24: tag is ignored, count pixels follow as BGR triples
+            for (k = 0; k < count; ++k) {
+               stbi_uc blue  = stbi__get8(s);
+               stbi_uc green = stbi__get8(s);
+               stbi_uc red   = stbi__get8(s);
+               stbi__bmp_os2_put_pixel(out, target, width, height, x++, y, red, green, blue);
+            }
+         }
+      } else if (tag == 0) { // end of line
+         x = 0;
+         ++y;
+      } else if (tag == 1) { // end of bitmap
+         break;
+      } else if (tag == 2) { // delta
+         x += stbi__get8(s);
+         y += stbi__get8(s);
+      } else { // absolute mode: tag pixels follow literally
+         int k;
+         if (info->compress == 1) { // RLE8, one byte per index
+            for (k = 0; k < tag; ++k) {
+               int idx = stbi__get8(s);
+               stbi__bmp_os2_put_pixel(out, target, width, height, x++, y, pal[idx][0], pal[idx][1], pal[idx][2]);
+            }
+            if (tag & 1) stbi__get8(s); // word-align the run
+         } else if (info->compress == 2) { // RLE4, two indices per byte
+            for (k = 0; k < tag; k += 2) {
+               int pair = stbi__get8(s);
+               stbi__bmp_os2_put_pixel(out, target, width, height, x++, y, pal[pair >> 4][0], pal[pair >> 4][1], pal[pair >> 4][2]);
+               if (k + 1 < tag)
+                  stbi__bmp_os2_put_pixel(out, target, width, height, x++, y, pal[pair & 15][0], pal[pair & 15][1], pal[pair & 15][2]);
+            }
+            if (((tag + 1) >> 1) & 1) stbi__get8(s); // word-align the run
+         } else { // RLE24, one BGR triple per pixel
+            for (k = 0; k < tag; ++k) {
+               stbi_uc blue  = stbi__get8(s);
+               stbi_uc green = stbi__get8(s);
+               stbi_uc red   = stbi__get8(s);
+               stbi__bmp_os2_put_pixel(out, target, width, height, x++, y, red, green, blue);
+            }
+            // absolute runs are word-aligned: 3 bytes/pixel, so an odd pixel
+            // count leaves an odd byte count and needs one pad byte
+            if ((tag * 3) & 1) stbi__get8(s);
+         }
+      }
+   }
+   return 1;
+}
+
+
 static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req_comp, stbi__result_info *ri)
 {
    stbi_uc *out;
@@ -5611,7 +5746,7 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
    if (info.offset < bytes_read_so_far)
       return stbi__errpuc("bad header", "Corrupt BMP");
 
-   if (info.hsz == 12) {
+   if (info.os2) {
       if (info.bpp < 24)
          psize = (info.offset - bytes_read_so_far) / 3;
    } else {
@@ -5660,10 +5795,15 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
          pal[i][2] = stbi__get8(s);
          pal[i][1] = stbi__get8(s);
          pal[i][0] = stbi__get8(s);
-         if (info.hsz != 12) stbi__get8(s);
+         if (!info.os2) stbi__get8(s);
          pal[i][3] = 255;
       }
-      stbi__skip(s, info.offset - info.extra_read - info.hsz - psize * (info.hsz == 12 ? 3 : 4));
+      stbi__skip(s, info.offset - info.extra_read - info.hsz - psize * (info.os2 ? 3 : 4));
+      if (info.os2 && info.compress != 0) {
+         memset(out, 0, (size_t) target * (size_t) s->img_x * (size_t) s->img_y);
+         stbi__bmp_os2_decode_rle(s, &info, out, target, pal);
+         goto bmp_decoded;
+      }
       if (info.bpp == 1) width = (s->img_x + 7) >> 3;
       else if (info.bpp == 4) width = (s->img_x + 1) >> 1;
       else if (info.bpp == 8) width = s->img_x;
@@ -5713,6 +5853,11 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
       int z = 0;
       int easy=0;
       stbi_uc alpha_override=0;
+      if (info.os2 && info.compress != 0) { // OS/2 RLE24, already skipped to pixel data
+         memset(out, 0, (size_t) target * (size_t) s->img_x * (size_t) s->img_y);
+         stbi__bmp_os2_decode_rle(s, &info, out, target, pal);
+         goto bmp_decoded;
+      }
       // psize is 0, already skipped to line data above
       if (info.bpp == 24) width = 3 * s->img_x;
       else if (info.bpp == 16) width = 2*s->img_x;
@@ -5766,6 +5911,7 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
       }
    }
 
+bmp_decoded:
    // if alpha channel is all 0s, replace with all 255s
    if (target == 4 && all_a == 0)
       for (i=4*s->img_x*s->img_y-1; i >= 0; i -= 4)

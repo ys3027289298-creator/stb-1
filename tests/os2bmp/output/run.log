@@ -1,0 +1,99 @@
+
+===== 1/12 environment =====
+cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+Copyright (C) 2023 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+
+===== 2/12 generate OS/2 BMP fixtures (1bit, 8bit RLE8, 24bit, bad header) =====
+wrote os2_1bit.bmp 40 bytes
+wrote os2_8bit_rle.bmp 105 bytes
+wrote os2_24bit.bmp 102 bytes
+wrote os2_badheader.bmp 78 bytes
+
+===== 3/12 fixture listing =====
+total 252
+-rwxr-xr-x 1 ys ys 114784 Nov 12 21:46 decode_demo
+-rwxr-xr-x 1 ys ys 110560 Nov 12 21:46 info_check
+-rw-r--r-- 1 ys ys    234 Nov 12 21:46 info_check.c
+-rw-r--r-- 1 ys ys     40 Nov 12 21:47 os2_1bit.bmp
+-rw-r--r-- 1 ys ys    102 Nov 12 21:47 os2_24bit.bmp
+-rw-r--r-- 1 ys ys    105 Nov 12 21:47 os2_8bit_rle.bmp
+-rw-r--r-- 1 ys ys     78 Nov 12 21:47 os2_badheader.bmp
+-rw-r--r-- 1 ys ys    515 Nov 12 21:47 run.log
+-rw-r--r-- 1 ys ys     70 Nov 12 21:46 win_ref.bmp
+
+===== 4/12 build decoder (stb_image) =====
+
+===== 5/12 decode 1-bit palette (OS/2 1.x, 12-byte header) =====
+file:   output/os2_1bit.bmp
+size:   4x2
+bpp:    1
+pixels: (0,0,0) (255,255,255) (0,0,0) (255,255,255) (255,255,255) (0,0,0) (255,255,255) (0,0,0)
+
+
+===== 6/12 decode 8-bit RLE8 palette (OS/2 2.x, 64-byte header) =====
+file:   output/os2_8bit_rle.bmp
+size:   6x2
+bpp:    8
+pixels: (0,0,255) (0,0,255) (0,0,255) (0,0,255) (255,0,0) (255,0,0) (0,255,0) (0,255,0)
+
+
+===== 7/12 decode 24-bit direct (OS/2 2.x, 64-byte header) =====
+file:   output/os2_24bit.bmp
+size:   3x2
+bpp:    24
+pixels: (255,0,0) (0,255,0) (0,0,255) (10,20,30) (40,50,60) (70,80,90)
+
+
+===== 8/12 decode bad header (expected failure with reason) =====
+file:   output/os2_badheader.bmp
+result: decode failed: OS/2 bad bpp
+
+
+===== 9/12 Windows BMP regression: write 40-byte header reference then decode =====
+file:   output/win_ref.bmp
+size:   2x2
+bpp:    24
+pixels: (1,2,3) (4,5,6) (7,8,9) (10,11,12)
+
+
+===== 10/12 stbi_info2 smoke across fixtures =====
+output/os2_1bit.bmp -> type=4 4x2 comp=3
+output/os2_8bit_rle.bmp -> type=4 6x2 comp=3
+output/os2_24bit.bmp -> type=4 3x2 comp=3
+output/os2_badheader.bmp -> type=0 0x0 comp=0
+output/win_ref.bmp -> type=4 2x2 comp=3
+
+===== 11/12 combined decode run =====
+file:   output/os2_1bit.bmp
+size:   4x2
+bpp:    1
+pixels: (0,0,0) (255,255,255) (0,0,0) (255,255,255) (255,255,255) (0,0,0) (255,255,255) (0,0,0)
+
+file:   output/os2_8bit_rle.bmp
+size:   6x2
+bpp:    8
+pixels: (0,0,255) (0,0,255) (0,0,255) (0,0,255) (255,0,0) (255,0,0) (0,255,0) (0,255,0)
+
+file:   output/os2_24bit.bmp
+size:   3x2
+bpp:    24
+pixels: (255,0,0) (0,255,0) (0,0,255) (10,20,30) (40,50,60) (70,80,90)
+
+file:   output/os2_badheader.bmp
+result: decode failed: OS/2 bad bpp
+
+
+===== 12/12 summary (artifacts in output/) =====
+total 252
+-rwxr-xr-x 1 ys ys 114784 Nov 12 21:47 decode_demo
+-rwxr-xr-x 1 ys ys 110560 Nov 12 21:47 info_check
+-rw-r--r-- 1 ys ys    234 Nov 12 21:47 info_check.c
+-rw-r--r-- 1 ys ys     40 Nov 12 21:47 os2_1bit.bmp
+-rw-r--r-- 1 ys ys    102 Nov 12 21:47 os2_24bit.bmp
+-rw-r--r-- 1 ys ys    105 Nov 12 21:47 os2_8bit_rle.bmp
+-rw-r--r-- 1 ys ys     78 Nov 12 21:47 os2_badheader.bmp
+-rw-r--r-- 1 ys ys   2810 Nov 12 21:47 run.log
+-rw-r--r-- 1 ys ys     70 Nov 12 21:47 win_ref.bmp
