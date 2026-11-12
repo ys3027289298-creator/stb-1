@@ -725,6 +725,12 @@ struct stbtt_fontinfo
    int index_map;                     // a cmap mapping for our chosen character encoding
    int indexToLocFormat;              // format needed to map from glyph index to glyph
 
+   int fvar;                          // 'fvar' table location as offset from start of .ttf, 0 if absent
+   int numAxes;                       // number of variation axes, 0 for non-variable fonts
+   int numInstances;                  // number of named variation instances
+   float *axisValues;                 // current instance coordinates, one normalized-less user value per axis
+   float *instanceCoordinates;        // named instance coordinates as floats, numInstances*numAxes entries
+
    stbtt__buf cff;                    // cff font data
    stbtt__buf charstrings;            // the charstring index
    stbtt__buf gsubrs;                 // global charstring subroutines index
@@ -739,6 +745,76 @@ STBTT_DEF int stbtt_InitFont(stbtt_fontinfo *info, const unsigned char *data, in
 // the stbtt_fontinfo yourself, and stbtt_InitFont will fill it out. You don't
 // need to do anything special to free it, because the contents are pure
 // value data with no additional data structures. Returns 0 on failure.
+
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// VARIABLE FONT AXES (fvar table)
+//
+// Variable fonts expose one or more variation axes (e.g. a weight axis with
+// tag 'wght'). stb_truetype reads the 'fvar' table during stbtt_InitFont();
+// fonts without a valid 'fvar' table behave exactly like regular fonts and
+// report zero axes. The axis metadata is read from the original font buffer,
+// which must remain valid for the lifetime of the stbtt_fontinfo.
+
+#define STBTT_FVAR_OK              0  // axis value accepted
+#define STBTT_FVAR_NO_FVAR        -1  // font has no (valid) fvar table
+#define STBTT_FVAR_BAD_AXIS       -2  // axis index or tag not found
+#define STBTT_FVAR_OUT_OF_RANGE   -3  // value outside the axis min/max range
+
+typedef struct
+{
+   stbtt_uint32 tag;        // four-byte axis tag, e.g. STBTT_TAG('w','g','h','t')
+   float minValue;          // minimum user-space coordinate
+   float defaultValue;      // default user-space coordinate
+   float maxValue;          // maximum user-space coordinate
+   stbtt_uint16 nameID;     // name table id of the axis display name
+   stbtt_uint16 flags;      // axis flags from the fvar table
+} stbtt_axisinfo;
+
+typedef struct
+{
+   stbtt_uint16 nameID;     // name table id of the instance display name
+   stbtt_uint16 flags;      // instance flags from the fvar table
+   // coordinates for every axis, in axis order; there are
+   // stbtt_GetAxisCount() of them
+   const float *coordinates;
+} stbtt_namedinstance;
+
+#define STBTT_TAG(c0,c1,c2,c3) ((stbtt_uint32)(unsigned char)(c0)<<24 | \
+                                 (stbtt_uint32)(unsigned char)(c1)<<16 | \
+                                 (stbtt_uint32)(unsigned char)(c2)<<8  | \
+                                 (stbtt_uint32)(unsigned char)(c3))
+
+STBTT_DEF int  stbtt_GetAxisCount(const stbtt_fontinfo *info);
+// Returns the number of variation axes, or 0 for a regular font.
+
+STBTT_DEF int  stbtt_GetAxisInfo(const stbtt_fontinfo *info, int axis_index, stbtt_axisinfo *axis);
+// Fills *axis with the metadata of axis axis_index. Returns 1 on success,
+// 0 if the font has no fvar table or the index is out of range.
+
+STBTT_DEF int  stbtt_GetNamedInstanceCount(const stbtt_fontinfo *info);
+// Returns the number of named variation instances, or 0 for a regular font.
+
+STBTT_DEF int  stbtt_GetNamedInstance(const stbtt_fontinfo *info, int instance_index, stbtt_namedinstance *instance);
+// Fills *instance with the named instance at instance_index. The coordinate
+// array points into the font buffer and must not be freed. Returns 1 on
+// success, 0 if the font has no fvar table or the index is out of range.
+
+STBTT_DEF int  stbtt_SetAxisValue(stbtt_fontinfo *info, int axis_index, float value);
+// Sets the current instance coordinate of axis axis_index (use
+// stbtt_SetAxisValueByTag() to select an axis by its four-byte tag). The
+// value must lie within the axis min/max range. Returns one of the
+// STBTT_FVAR_* codes above.
+
+STBTT_DEF int  stbtt_SetAxisValueByTag(stbtt_fontinfo *info, stbtt_uint32 tag, float value);
+// Same as stbtt_SetAxisValue() but selects the axis by tag, e.g.
+// stbtt_SetAxisValueByTag(&font, STBTT_TAG('w','g','h','t'), 700.0f).
+
+STBTT_DEF int  stbtt_GetAxisValue(const stbtt_fontinfo *info, int axis_index, float *value);
+// Writes the current instance coordinate of axis axis_index to *value.
+// Returns 1 on success, 0 if the font has no fvar table or the index is
+// out of range.
 
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1399,6 +1475,8 @@ static int stbtt__get_svg(stbtt_fontinfo *info)
    return info->svg;
 }
 
+static void stbtt__init_fvar(stbtt_fontinfo *info);
+
 static int stbtt_InitFont_internal(stbtt_fontinfo *info, unsigned char *data, int fontstart)
 {
    stbtt_uint32 cmap, t;
@@ -1518,6 +1596,176 @@ static int stbtt_InitFont_internal(stbtt_fontinfo *info, unsigned char *data, in
       return 0;
 
    info->indexToLocFormat = ttUSHORT(data+info->head + 50);
+   stbtt__init_fvar(info);
+   return 1;
+}
+
+// find a table and its declared length; returns 0 (and leaves *length 0) if absent
+static stbtt_uint32 stbtt__find_table_len(stbtt_uint8 *data, stbtt_uint32 fontstart, const char *tag, stbtt_uint32 *length)
+{
+   stbtt_int32 num_tables = ttUSHORT(data+fontstart+4);
+   stbtt_uint32 tabledir = fontstart + 12;
+   stbtt_int32 i;
+   *length = 0;
+   for (i=0; i < num_tables; ++i) {
+      stbtt_uint32 loc = tabledir + 16*i;
+      if (stbtt_tag(data+loc+0, tag)) {
+         *length = ttULONG(data+loc+12);
+         return ttULONG(data+loc+8);
+      }
+   }
+   return 0;
+}
+
+// read the fvar table if present; anything malformed (or missing) leaves the
+// font in regular, non-variable mode so the rest of the library is unaffected
+// note: ttFixed() is an alias for ttLONG() in this library and returns the
+// raw 16.16 fixed-point integer, so convert it explicitly here
+static float stbtt__fixed_to_float(stbtt_int32 v)
+{
+   return (float) v / 65536.0f;
+}
+
+static void stbtt__init_fvar(stbtt_fontinfo *info)
+{
+   stbtt_uint32 fvar, fvar_len;
+   stbtt_uint16 axes_array_offset, axis_count, axis_size, instance_count, instance_size;
+   stbtt_int32 i, j;
+
+   info->fvar = 0;
+   info->numAxes = 0;
+   info->numInstances = 0;
+   info->axisValues = NULL;
+   info->instanceCoordinates = NULL;
+
+   fvar = stbtt__find_table_len(info->data, (stbtt_uint32) info->fontstart, "fvar", &fvar_len);
+   if (!fvar || fvar_len < 16)
+      return;
+   if (ttUSHORT(info->data+fvar+0) != 1) // majorVersion must be 1
+      return;
+   axes_array_offset = ttUSHORT(info->data+fvar+4);
+   // fvar header: major(2) minor(2) axesArrayOffset(2) reserved(2)
+   //              axisCount(2) axisSize(2) instanceCount(2) instanceSize(2)
+   axis_count = ttUSHORT(info->data+fvar+8);
+   axis_size = ttUSHORT(info->data+fvar+10);
+   instance_count = ttUSHORT(info->data+fvar+12);
+   instance_size = ttUSHORT(info->data+fvar+14);
+   if (axis_count == 0 || axis_size < 20 || instance_size < (stbtt_uint16)(6 + 4*axis_count))
+      return;
+   if ((stbtt_uint32)axes_array_offset + (stbtt_uint32)axis_count*axis_size > fvar_len)
+      return;
+   if ((stbtt_uint32)axes_array_offset
+       + (stbtt_uint32)axis_count*axis_size
+       + (stbtt_uint32)instance_count*instance_size > fvar_len)
+      return;
+
+   for (i=0; i < axis_count; ++i) {
+      stbtt_uint8 *a = info->data + fvar + axes_array_offset + (stbtt_uint32)i*axis_size;
+      float minv = stbtt__fixed_to_float(ttLONG(a+4));
+      float defv = stbtt__fixed_to_float(ttLONG(a+8));
+      float maxv = stbtt__fixed_to_float(ttLONG(a+12));
+      if (!(minv <= defv && defv <= maxv))
+         return;
+   }
+
+   info->axisValues = (float *) STBTT_malloc(sizeof(float)*axis_count, info->userdata);
+   if (!info->axisValues)
+      return;
+   info->instanceCoordinates = NULL;
+   if (instance_count) {
+      info->instanceCoordinates = (float *) STBTT_malloc(sizeof(float)*axis_count*instance_count, info->userdata);
+      if (!info->instanceCoordinates) {
+         STBTT_free(info->axisValues, info->userdata);
+         info->axisValues = NULL;
+         return;
+      }
+   }
+
+   for (i=0; i < axis_count; ++i) {
+      stbtt_uint8 *a = info->data + fvar + axes_array_offset + (stbtt_uint32)i*axis_size;
+      info->axisValues[i] = stbtt__fixed_to_float(ttLONG(a+8)); // default value
+   }
+   for (j=0; j < instance_count; ++j) {
+      stbtt_uint8 *r = info->data + fvar + axes_array_offset + (stbtt_uint32)axis_count*axis_size
+                            + (stbtt_uint32)j*instance_size + 6;
+      for (i=0; i < axis_count; ++i)
+         info->instanceCoordinates[j*axis_count+i] = stbtt__fixed_to_float(ttLONG(r + 4*i));
+   }
+
+   info->fvar = (int) fvar;
+   info->numAxes = axis_count;
+   info->numInstances = instance_count;
+}
+
+STBTT_DEF int stbtt_GetAxisCount(const stbtt_fontinfo *info)
+{
+   return info->numAxes;
+}
+
+STBTT_DEF int stbtt_GetAxisInfo(const stbtt_fontinfo *info, int axis_index, stbtt_axisinfo *axis)
+{
+   stbtt_uint8 *a;
+   if (!info->fvar || (stbtt_uint32)axis_index >= (stbtt_uint32)info->numAxes || !axis)
+      return 0;
+   a = info->data + info->fvar + ttUSHORT(info->data+info->fvar+4)
+       + (stbtt_uint32)axis_index*ttUSHORT(info->data+info->fvar+10);
+   axis->tag = ttULONG(a);
+   axis->minValue = stbtt__fixed_to_float(ttLONG(a+4));
+   axis->defaultValue = stbtt__fixed_to_float(ttLONG(a+8));
+   axis->maxValue = stbtt__fixed_to_float(ttLONG(a+12));
+   axis->flags = ttUSHORT(a+16);
+   axis->nameID = ttUSHORT(a+18);
+   return 1;
+}
+
+STBTT_DEF int stbtt_GetNamedInstanceCount(const stbtt_fontinfo *info)
+{
+   return info->numInstances;
+}
+
+STBTT_DEF int stbtt_GetNamedInstance(const stbtt_fontinfo *info, int instance_index, stbtt_namedinstance *instance)
+{
+   stbtt_uint8 *r;
+   if (!info->fvar || (stbtt_uint32)instance_index >= (stbtt_uint32)info->numInstances || !instance)
+      return 0;
+   r = info->data + info->fvar + ttUSHORT(info->data+info->fvar+4)
+       + (stbtt_uint32)info->numAxes*ttUSHORT(info->data+info->fvar+10)
+       + (stbtt_uint32)instance_index*ttUSHORT(info->data+info->fvar+14);
+   instance->nameID = ttUSHORT(r);
+   instance->flags = ttUSHORT(r+2);
+   instance->coordinates = info->instanceCoordinates + (stbtt_uint32)instance_index*info->numAxes;
+   return 1;
+}
+
+STBTT_DEF int stbtt_SetAxisValue(stbtt_fontinfo *info, int axis_index, float value)
+{
+   stbtt_axisinfo axis;
+   if (!info->fvar)
+      return STBTT_FVAR_NO_FVAR;
+   if (!stbtt_GetAxisInfo(info, axis_index, &axis))
+      return STBTT_FVAR_BAD_AXIS;
+   if (!(value >= axis.minValue && value <= axis.maxValue))
+      return STBTT_FVAR_OUT_OF_RANGE;
+   info->axisValues[axis_index] = value;
+   return STBTT_FVAR_OK;
+}
+
+STBTT_DEF int stbtt_SetAxisValueByTag(stbtt_fontinfo *info, stbtt_uint32 tag, float value)
+{
+   int i;
+   for (i=0; i < info->numAxes; ++i) {
+      stbtt_axisinfo axis;
+      if (stbtt_GetAxisInfo(info, i, &axis) && axis.tag == tag)
+         return stbtt_SetAxisValue(info, i, value);
+   }
+   return info->fvar ? STBTT_FVAR_BAD_AXIS : STBTT_FVAR_NO_FVAR;
+}
+
+STBTT_DEF int stbtt_GetAxisValue(const stbtt_fontinfo *info, int axis_index, float *value)
+{
+   if (!info->fvar || (stbtt_uint32)axis_index >= (stbtt_uint32)info->numAxes || !value)
+      return 0;
+   *value = info->axisValues[axis_index];
    return 1;
 }
 
