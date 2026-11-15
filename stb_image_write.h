@@ -1,5 +1,5 @@
-/* stb_image_write - v1.18 - public domain - http://nothings.org/stb
-   writes out PNG/BMP/TGA/JPEG/HDR images to C stdio - Sean Barrett 2010-2015
+/* stb_image_write - v1.19 - public domain - http://nothings.org/stb
+   writes out PNG/BMP/TGA/JPEG/HDR/KTX2 images to C stdio - Sean Barrett 2010-2015
                                      no warranty implied; use at your own risk
 
    Before #including,
@@ -42,13 +42,14 @@ UNICODE:
 
 USAGE:
 
-   There are five functions, one for each image file format:
+   There are six functions, one for each image file format:
 
      int stbi_write_png(char const *filename, int w, int h, int comp, const void *data, ptrdiff_t stride_in_bytes);
      int stbi_write_bmp(char const *filename, int w, int h, int comp, const void *data);
      int stbi_write_tga(char const *filename, int w, int h, int comp, const void *data);
      int stbi_write_jpg(char const *filename, int w, int h, int comp, const void *data, int quality);
      int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
+     int stbi_write_ktx2(char const *filename, int w, int h, int comp, const void *data, int num_levels);
 
      void stbi_flip_vertically_on_write(int flag); // flag is non-zero to flip data vertically
 
@@ -60,7 +61,7 @@ USAGE:
      int stbi_write_jpg_strided(char const *filename, int w, int h, int comp, const void *data, ptrdiff_t stride_in_bytes, int quality);
      int stbi_write_hdr_strided(char const *filename, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
 
-   There are also five equivalent functions that use an arbitrary write function. You are
+   There are also six equivalent functions that use an arbitrary write function. You are
    expected to open/close your file-equivalent before and after calling these:
 
      int stbi_write_png_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
@@ -68,6 +69,7 @@ USAGE:
      int stbi_write_tga_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
      int stbi_write_hdr_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
      int stbi_write_jpg_to_func(stbi_write_func *func, void *context, int x, int y, int comp, int quality, const void *data, ptrdiff_t stride_in_bytes);
+     int stbi_write_ktx2_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data, int num_levels);
 
    where the callback is:
       void stbi_write_func(void *context, void *data, int size);
@@ -128,6 +130,17 @@ USAGE:
    JPEG does ignore alpha channels in input data; quality is between 1 and 100.
    Higher quality looks better but results in a bigger image.
    JPEG baseline (no JPEG progressive).
+
+   KTX2 (Khronos Texture 2.0) writes an uncompressed 8-bit texture container
+   with a mip chain. 'data' must point to 'num_levels' mip levels stored
+   consecutively, level 0 first; level i has dimensions max(1,w>>i) by
+   max(1,h>>i) with rows tightly packed. 'num_levels' must be between 1 and
+   the length of the full mip chain for the given dimensions,
+   floor(log2(max(w,h)))+1. The channel count comp (1..4) maps to the Vulkan
+   formats R8, R8G8, R8G8B8 and R8G8B8A8_UNORM. The levels are stored in the
+   file smallest-first, as the KTX2 specification requires, and each level is
+   stored exactly as the raw bytes you pass in. stbi_flip_vertically_on_write
+   flips every level vertically.
 
 CREDITS:
 
@@ -200,6 +213,7 @@ STBIWDEF int stbi_write_bmp(char const *filename, int w, int h, int comp, const 
 STBIWDEF int stbi_write_tga(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
 STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const void  *data, int quality);
+STBIWDEF int stbi_write_ktx2(char const *filename, int w, int h, int comp, const void  *data, int num_levels);
 
 STBIWDEF int stbi_write_bmp_strided(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_tga_strided(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
@@ -218,6 +232,7 @@ STBIWDEF int stbi_write_bmp_to_func(stbi_write_func *func, void *context, int w,
 STBIWDEF int stbi_write_tga_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data);
 STBIWDEF int stbi_write_jpg_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, int quality);
+STBIWDEF int stbi_write_ktx2_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data, int num_levels);
 
 STBIWDEF int stbi_write_bmp_strided_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_tga_strided_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
@@ -1825,9 +1840,132 @@ STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const 
 }
 #endif
 
+// KTX2 (Khronos Texture 2.0) writer: uncompressed 8-bit formats only.
+// 'data' packs 'num_levels' mip levels consecutively, level 0 first, with
+// level i being max(1,w>>i) x max(1,h>>i) pixels of 'comp' bytes each.
+static int stbi_write_ktx2_core(stbi__write_context *s, int w, int h, int comp, const void *data, int num_levels)
+{
+   // KTX2 identifier: «KTX 20» followed by CR, LF, SUB, LF
+   static const unsigned char ktx2_identifier[12] = { 0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
+   // VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM
+   static const stbiw_uint32 ktx2_vkformat[5] = { 0, 9, 16, 23, 37 };
+   static const unsigned char ktx2_zero[12] = { 0 };
+   stbiw_uint32 level_size[32], level_offset[32], src_offset[32];
+   stbiw_uint32 dfd_length, offset, align, pos;
+   int i, max_levels, max_dim;
+
+   if (!stbiw__validate_dimensions(w, h, comp))
+      return 0;
+   if (data == NULL)
+      return 0;
+
+   // the mip chain can go down to 1x1 at most
+   max_dim = w > h ? w : h;
+   max_levels = 1;
+   while (max_dim > 1) {
+      max_dim >>= 1;
+      ++max_levels;
+   }
+   if (num_levels < 1 || num_levels > max_levels)
+      return 0;
+
+   // per-level byte sizes and source offsets, with overflow checks
+   src_offset[0] = 0;
+   for (i = 0; i < num_levels; ++i) {
+      int lw = w >> i; if (lw < 1) lw = 1;
+      int lh = h >> i; if (lh < 1) lh = 1;
+      if (!stbiw__mul2sizes_valid(lw, lh) || !stbiw__mul2sizes_valid(lw*lh, comp))
+         return 0;
+      level_size[i] = (stbiw_uint32) (lw * lh * comp);
+      if (i+1 < num_levels)
+         src_offset[i+1] = src_offset[i] + level_size[i];
+   }
+
+   // KTX2 stores mip levels smallest-first; for uncompressed data each level
+   // must be aligned to lcm(texel block size, 4)
+   align = (comp == 3) ? 12 : 4;
+   dfd_length = 28 + 16*(stbiw_uint32) comp; // KHR_DF basic block, one sample per channel
+   offset = 80 + 24*(stbiw_uint32) num_levels + dfd_length;
+   for (i = num_levels - 1; i >= 0; --i) {
+      offset += (align - offset % align) % align; // align is not always a power of 2
+      level_offset[i] = offset;
+      offset += level_size[i];
+   }
+
+   // header: identifier, then 13 uint32 fields, then 2 uint64 (sgd)
+   s->func(s->context, (void *) ktx2_identifier, 12);
+   stbiw__writef(s, "4444444444444",
+      ktx2_vkformat[comp], 1, w, h, 0, 0, 1, num_levels, 0,
+      80 + 24*num_levels, dfd_length, 0, 0);
+   stbiw__writef(s, "4444", 0, 0, 0, 0); // sgdByteOffset, sgdByteLength
+
+   // level index, indexed by level number (level 0 first)
+   for (i = 0; i < num_levels; ++i)
+      stbiw__writef(s, "444444", level_offset[i], 0, level_size[i], 0, level_size[i], 0);
+
+   // Khronos Data Format descriptor: basic block with one sample per channel
+   stbiw__writef(s, "4", dfd_length);        // totalSize
+   stbiw__writef(s, "22", 0, 0);             // vendorId, descriptorType=BASICFORMAT
+   stbiw__writef(s, "22", 2, 24 + 16*comp);  // versionNumber, descriptorBlockSize
+   stbiw__writef(s, "1111", 1, 1, 2, 0);     // colorModel=RGBSDA, primaries=BT709, transfer=SRGB, flags
+   stbiw__writef(s, "1111", 0, 0, 0, 0);     // texelBlockDimension (0 means 1)
+   stbiw__writef(s, "11111111", comp, 0, 0, 0, 0, 0, 0, 0); // bytesPlane
+   for (i = 0; i < comp; ++i)
+      stbiw__writef(s, "211111144",
+         8*i, 7, i < 3 ? i : 15, // bitOffset, bitLength-1, channelType R/G/B/A
+         0, 0, 0, 0,             // samplePosition
+         0, 0x3f800000);         // sampleLower=0.0f, sampleUpper=1.0f (UNORM)
+
+   // level data, smallest level first, each aligned
+   pos = 80 + 24*(stbiw_uint32) num_levels + dfd_length;
+   for (i = num_levels - 1; i >= 0; --i) {
+      const unsigned char *base = (const unsigned char *) data + src_offset[i];
+      int lw = w >> i; if (lw < 1) lw = 1;
+      int lh = h >> i; if (lh < 1) lh = 1;
+      int row = lw * comp;
+      if (level_offset[i] > pos) { // alignment padding
+         s->func(s->context, (void *) ktx2_zero, (int) (level_offset[i] - pos));
+         pos = level_offset[i];
+      }
+      if (stbi__flip_vertically_on_write) {
+         int y;
+         for (y = lh-1; y >= 0; --y)
+            s->func(s->context, (void *) (base + y*row), row);
+      } else {
+         s->func(s->context, (void *) base, (int) level_size[i]);
+      }
+      pos += level_size[i];
+   }
+
+   return 1;
+}
+
+STBIWDEF int stbi_write_ktx2_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data, int num_levels)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   stbi__start_write_callbacks(&s, func, context);
+   return stbi_write_ktx2_core(&s, w, h, comp, data, num_levels);
+}
+
+#ifndef STBI_WRITE_NO_STDIO
+STBIWDEF int stbi_write_ktx2(char const *filename, int w, int h, int comp, const void *data, int num_levels)
+{
+   stbi__write_context s;
+   memset(&s, 0, sizeof(s));
+   if (stbi__start_write_file(&s,filename)) {
+      int r = stbi_write_ktx2_core(&s, w, h, comp, data, num_levels);
+      return stbi__end_write_file(&s, r);
+   } else
+      return 0;
+}
+#endif //!STBI_WRITE_NO_STDIO
+
 #endif // STB_IMAGE_WRITE_IMPLEMENTATION
 
 /* Revision history
+      1.19  (2026-11-15)
+             add KTX2 writer (uncompressed 8-bit formats, mip chains)
       1.16  (2021-07-11)
              make Deflate code emit uncompressed blocks when it would otherwise expand
              support writing BMPs with alpha channel
