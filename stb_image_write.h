@@ -1,4 +1,4 @@
-/* stb_image_write - v1.18 - public domain - http://nothings.org/stb
+/* stb_image_write - v1.19 - public domain - http://nothings.org/stb
    writes out PNG/BMP/TGA/JPEG/HDR images to C stdio - Sean Barrett 2010-2015
                                      no warranty implied; use at your own risk
 
@@ -225,6 +225,29 @@ STBIWDEF int stbi_write_hdr_strided_to_func(stbi_write_func *func, void *context
 STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
 
 STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
+
+// dithering methods for stbi_write_palette_dither
+#define STBIW_DITHER_BAYER           0   // Bayer ordered dithering
+#define STBIW_DITHER_ERROR_DIFFUSION 1   // Floyd-Steinberg error diffusion
+
+typedef struct
+{
+   int   levels;        // number of distinct palette colors actually used
+   float mean_error;    // mean absolute per-channel error against the source image (0..255)
+   int   deterministic; // 1 if processing the same input twice yields identical output
+   int   encoded_size;  // in-memory PNG size of the dithered image, in bytes
+} stbiw_palette_info;
+
+// Quantizes 'pixels' to a palette of 'num_colors' (2..256) built with median-cut,
+// then maps every pixel to a palette index using either Bayer ordered dithering
+// (STBIW_DITHER_BAYER, 'bayer_size' must be 2, 4, 8 or 16) or Floyd-Steinberg
+// error diffusion (STBIW_DITHER_ERROR_DIFFUSION, 'bayer_size' is ignored).
+// 'out_rgb' must point to w*h*3 bytes and receives the dithered 24-bit image.
+// If 'info' is non-NULL it receives statistics about the result.
+// Returns 0 on invalid arguments or allocation failure, non-0 on success.
+STBIWDEF int stbi_write_palette_dither(const unsigned char *pixels, int w, int h, int comp,
+                                       int num_colors, int dither_method, int bayer_size,
+                                       unsigned char *out_rgb, stbiw_palette_info *info);
 
 #endif//INCLUDE_STB_IMAGE_WRITE_H
 
@@ -1825,9 +1848,296 @@ STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const 
 }
 #endif
 
+//////////////////////////////////////////////////////////////////////////////
+//
+// palette quantization (median-cut) + dithering
+//
+
+static int stbiw__mc_sort_channel;
+
+static int stbiw__mc_compare(const void *p, const void *q)
+{
+   const unsigned char *a = (const unsigned char *) p;
+   const unsigned char *b = (const unsigned char *) q;
+   return (int) a[stbiw__mc_sort_channel] - (int) b[stbiw__mc_sort_channel];
+}
+
+// median-cut color quantization: reorders 'rgb' (n*3 bytes) and fills 'palette'
+// with up to 'num_colors' averaged colors; returns the number of palette entries
+static int stbiw__median_cut(unsigned char *rgb, int n, int num_colors, unsigned char *palette)
+{
+   int starts[256], counts[256];
+   int nboxes = 1, i, j, c;
+
+   starts[0] = 0;
+   counts[0] = n;
+   while (nboxes < num_colors) {
+      int best = -1, best_range = 0, best_channel = 0;
+      for (i = 0; i < nboxes; ++i) {
+         int lo[3] = { 255, 255, 255 }, hi[3] = { 0, 0, 0 };
+         if (counts[i] < 2)
+            continue;
+         for (j = starts[i]; j < starts[i] + counts[i]; ++j)
+            for (c = 0; c < 3; ++c) {
+               if (rgb[j*3+c] < lo[c]) lo[c] = rgb[j*3+c];
+               if (rgb[j*3+c] > hi[c]) hi[c] = rgb[j*3+c];
+            }
+         for (c = 0; c < 3; ++c)
+            if (hi[c] - lo[c] > best_range) {
+               best_range   = hi[c] - lo[c];
+               best         = i;
+               best_channel = c;
+            }
+      }
+      if (best < 0)
+         break;
+      stbiw__mc_sort_channel = best_channel;
+      qsort(rgb + starts[best]*3, (size_t) counts[best], 3, stbiw__mc_compare);
+      starts[nboxes] = starts[best] + counts[best]/2;
+      counts[nboxes] = counts[best] - counts[best]/2;
+      counts[best]   = counts[best]/2;
+      ++nboxes;
+   }
+   for (i = 0; i < nboxes; ++i) {
+      int sum[3] = { 0, 0, 0 };
+      for (j = starts[i]; j < starts[i] + counts[i]; ++j)
+         for (c = 0; c < 3; ++c)
+            sum[c] += rgb[j*3+c];
+      for (c = 0; c < 3; ++c)
+         palette[i*3+c] = (unsigned char) (sum[c]/counts[i]);
+   }
+   return nboxes;
+}
+
+static int stbiw__nearest_palette(const unsigned char *palette, int num_colors, int r, int g, int b)
+{
+   int best = 0, best_dist = 3*255*255 + 1, i;
+   for (i = 0; i < num_colors; ++i) {
+      int dr = r - palette[i*3+0];
+      int dg = g - palette[i*3+1];
+      int db = b - palette[i*3+2];
+      int d  = dr*dr + dg*dg + db*db;
+      if (d < best_dist) {
+         best_dist = d;
+         best      = i;
+      }
+   }
+   return best;
+}
+
+// generates a size x size Bayer ordered-dither matrix (size must be 2, 4, 8 or 16)
+static void stbiw__bayer_matrix(int size, int *mat)
+{
+   static const int m2[4] = { 0, 2, 3, 1 };
+   int tmp[256];
+   int n = 2, x, y, i;
+   mat[0] = 0; mat[1] = 2; mat[2] = 3; mat[3] = 1;
+   while (n < size) {
+      for (y = 0; y < 2*n; ++y)
+         for (x = 0; x < 2*n; ++x)
+            tmp[y*2*n + x] = 4*mat[(y%n)*n + (x%n)] + m2[(y/n)*2 + (x/n)];
+      n *= 2;
+      for (i = 0; i < n*n; ++i)
+         mat[i] = tmp[i];
+   }
+}
+
+static void stbiw__dither_bayer(const unsigned char *rgb, int w, int h, const unsigned char *palette,
+                                int num_colors, int bayer_size, unsigned char *out)
+{
+   int mat[256];
+   int x, y, c;
+   int levels = 1;
+   float amplitude;
+   stbiw__bayer_matrix(bayer_size, mat);
+   while (levels*levels*levels < num_colors)
+      ++levels;
+   amplitude = 255.0f/levels;
+   for (y = 0; y < h; ++y)
+      for (x = 0; x < w; ++x) {
+         const unsigned char *src = rgb + ((size_t) y*w + x)*3;
+         unsigned char *dst = out + ((size_t) y*w + x)*3;
+         float t = ((float) mat[(y%bayer_size)*bayer_size + (x%bayer_size)] + 0.5f)/(bayer_size*bayer_size) - 0.5f;
+         int v[3], idx;
+         for (c = 0; c < 3; ++c) {
+            float f = src[c] + t*amplitude;
+            v[c] = f < 0 ? 0 : f > 255 ? 255 : (int) f;
+         }
+         idx = stbiw__nearest_palette(palette, num_colors, v[0], v[1], v[2]);
+         dst[0] = palette[idx*3+0];
+         dst[1] = palette[idx*3+1];
+         dst[2] = palette[idx*3+2];
+      }
+}
+
+// Floyd-Steinberg error diffusion with serpentine (boustrophedon) scanning
+static int stbiw__dither_error_diffusion(const unsigned char *rgb, int w, int h, const unsigned char *palette,
+                                         int num_colors, unsigned char *out)
+{
+   float *cur, *next;
+   int y, i, c;
+   cur = (float *) STBIW_MALLOC(sizeof(float)*(size_t) w*3);
+   if (cur == NULL)
+      return 0;
+   next = (float *) STBIW_MALLOC(sizeof(float)*(size_t) w*3);
+   if (next == NULL) {
+      STBIW_FREE(cur);
+      return 0;
+   }
+   memset(cur, 0, sizeof(float)*(size_t) w*3);
+   for (y = 0; y < h; ++y) {
+      int dir = (y & 1) ? -1 : 1;
+      memset(next, 0, sizeof(float)*(size_t) w*3);
+      for (i = 0; i < w; ++i) {
+         int x = (dir > 0) ? i : w - 1 - i;
+         const unsigned char *src = rgb + ((size_t) y*w + x)*3;
+         unsigned char *dst = out + ((size_t) y*w + x)*3;
+         int v[3], e[3], idx;
+         for (c = 0; c < 3; ++c) {
+            float f = src[c] + cur[x*3+c];
+            v[c] = f < 0 ? 0 : f > 255 ? 255 : (int) (f + 0.5f);
+         }
+         idx = stbiw__nearest_palette(palette, num_colors, v[0], v[1], v[2]);
+         for (c = 0; c < 3; ++c) {
+            dst[c] = palette[idx*3+c];
+            e[c]   = v[c] - palette[idx*3+c];
+         }
+         for (c = 0; c < 3; ++c) {
+            int xr = x + dir;
+            if (xr >= 0 && xr < w)
+               cur[xr*3+c] += e[c]*(7.0f/16);
+            if (x - dir >= 0 && x - dir < w)
+               next[(x-dir)*3+c] += e[c]*(3.0f/16);
+            next[x*3+c] += e[c]*(5.0f/16);
+            if (xr >= 0 && xr < w)
+               next[xr*3+c] += e[c]*(1.0f/16);
+         }
+      }
+      memcpy(cur, next, sizeof(float)*(size_t) w*3);
+   }
+   STBIW_FREE(cur);
+   STBIW_FREE(next);
+   return 1;
+}
+
+STBIWDEF int stbi_write_palette_dither(const unsigned char *pixels, int w, int h, int comp,
+                                       int num_colors, int dither_method, int bayer_size,
+                                       unsigned char *out_rgb, stbiw_palette_info *info)
+{
+   size_t n, i;
+   unsigned char *rgb, *work, *palette;
+   int ncol, ok;
+
+   if (pixels == NULL || out_rgb == NULL)
+      return 0;
+   if (w <= 0 || h <= 0 || comp < 1 || comp > 4)
+      return 0;
+   if ((size_t) w*(size_t) h > (size_t) INT_MAX/3)
+      return 0;
+   if (num_colors < 2 || num_colors > 256)
+      return 0;
+   if (dither_method != STBIW_DITHER_BAYER && dither_method != STBIW_DITHER_ERROR_DIFFUSION)
+      return 0;
+   if (dither_method == STBIW_DITHER_BAYER &&
+       bayer_size != 2 && bayer_size != 4 && bayer_size != 8 && bayer_size != 16)
+      return 0;
+
+   n = (size_t) w*(size_t) h;
+   rgb     = (unsigned char *) STBIW_MALLOC(n*3);
+   work    = (unsigned char *) STBIW_MALLOC(n*3);
+   palette = (unsigned char *) STBIW_MALLOC((size_t) num_colors*3);
+   if (rgb == NULL || work == NULL || palette == NULL) {
+      STBIW_FREE(rgb);
+      STBIW_FREE(work);
+      STBIW_FREE(palette);
+      return 0;
+   }
+
+   // expand the source to 24-bit rgb
+   for (i = 0; i < n; ++i) {
+      const unsigned char *px = pixels + i*(size_t) comp;
+      if (comp < 3) {
+         rgb[i*3+0] = rgb[i*3+1] = rgb[i*3+2] = px[0];
+      } else {
+         rgb[i*3+0] = px[0];
+         rgb[i*3+1] = px[1];
+         rgb[i*3+2] = px[2];
+      }
+   }
+
+   memcpy(work, rgb, n*3);
+   ncol = stbiw__median_cut(work, (int) n, num_colors, palette);
+
+   if (dither_method == STBIW_DITHER_BAYER) {
+      stbiw__dither_bayer(rgb, w, h, palette, ncol, bayer_size, out_rgb);
+      ok = 1;
+   } else {
+      ok = stbiw__dither_error_diffusion(rgb, w, h, palette, ncol, out_rgb);
+   }
+
+   if (ok && info != NULL) {
+      unsigned char used[256];
+      double err = 0;
+      int j;
+
+      memset(used, 0, sizeof(used));
+      for (i = 0; i < n; ++i) {
+         for (j = 0; j < ncol; ++j)
+            if (out_rgb[i*3+0] == palette[j*3+0] &&
+                out_rgb[i*3+1] == palette[j*3+1] &&
+                out_rgb[i*3+2] == palette[j*3+2]) {
+               used[j] = 1;
+               break;
+            }
+         err += (double) (abs((int) out_rgb[i*3+0] - (int) rgb[i*3+0]) +
+                          abs((int) out_rgb[i*3+1] - (int) rgb[i*3+1]) +
+                          abs((int) out_rgb[i*3+2] - (int) rgb[i*3+2]));
+      }
+      info->levels = 0;
+      for (j = 0; j < ncol; ++j)
+         info->levels += used[j];
+      info->mean_error = (float) (err/(n*3));
+
+      // determinism: run the same pipeline again and compare
+      {
+         unsigned char *again = (unsigned char *) STBIW_MALLOC(n*3);
+         if (again != NULL) {
+            if (dither_method == STBIW_DITHER_BAYER) {
+               stbiw__dither_bayer(rgb, w, h, palette, ncol, bayer_size, again);
+               info->deterministic = 1;
+            } else {
+               info->deterministic = stbiw__dither_error_diffusion(rgb, w, h, palette, ncol, again);
+            }
+            if (info->deterministic)
+               info->deterministic = memcmp(again, out_rgb, n*3) == 0;
+            STBIW_FREE(again);
+         } else {
+            info->deterministic = 0;
+         }
+      }
+
+      // encoded size: PNG-encode the dithered image in memory
+      {
+         int len = 0;
+         unsigned char *png = stbi_write_png_to_mem(out_rgb, w*3, w, h, 3, &len);
+         info->encoded_size = png != NULL ? len : 0;
+         if (png != NULL)
+            STBIW_FREE(png);
+      }
+   }
+
+   STBIW_FREE(rgb);
+   STBIW_FREE(work);
+   STBIW_FREE(palette);
+   return ok;
+}
+
 #endif // STB_IMAGE_WRITE_IMPLEMENTATION
 
 /* Revision history
+      1.19  (2026-11-16)
+             add stbi_write_palette_dither: median-cut palette quantization
+             with Bayer ordered dithering or error diffusion
       1.16  (2021-07-11)
              make Deflate code emit uncompressed blocks when it would otherwise expand
              support writing BMPs with alpha channel
