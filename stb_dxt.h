@@ -60,6 +60,45 @@ STBDDEF void stb_compress_dxt_block(unsigned char *dest, const unsigned char *sr
 STBDDEF void stb_compress_bc4_block(unsigned char *dest, const unsigned char *src_r_one_byte_per_pixel);
 STBDDEF void stb_compress_bc5_block(unsigned char *dest, const unsigned char *src_rg_two_byte_per_pixel);
 
+// ----------------------------------------------------------------------------
+// Pixel-art color reduction: lookup-table quantization with optional
+// Bayer ordered dithering or Floyd-Steinberg error diffusion.
+//
+// Levels N (2..256) are configured per call; the 256-entry lookup table is
+// built once with stb_build_quantize_lut() and reused for every pixel so the
+// per-channel reduction itself is a single table read.
+#define STB_QUANT_LUT_ENTRIES    256
+
+// reduction modes
+#define STB_PIXEL_QUANTIZE       0  // plain LUT quantization (posterize)
+#define STB_PIXEL_BAYER          1  // LUT quantization + Bayer ordered dither
+#define STB_PIXEL_ERROR_DIFFUSE  2  // Floyd-Steinberg error diffusion
+
+// return codes (>= 0 is success; < 0 is a parameter error)
+#define STB_PIXEL_OK              0
+#define STB_PIXEL_ERR_LEVELS     -1  // N outside [2, 256]
+#define STB_PIXEL_ERR_MODE       -2  // unknown mode
+#define STB_PIXEL_ERR_BAYER      -3  // bayer_size not 2, 4 or 8
+#define STB_PIXEL_ERR_STRENGTH   -4  // strength outside [0, 100]
+#define STB_PIXEL_ERR_DIMENSIONS -5  // width/height <= 0
+#define STB_PIXEL_ERR_CHANNELS   -6  // channels not 1..4
+#define STB_PIXEL_ERR_POINTER    -7  // NULL image or lookup table
+#define STB_PIXEL_ERR_NOMEM      -8  // internal allocation failed
+
+// Build the 256-entry quantization table for N output levels (2..256).
+// Returns STB_PIXEL_OK or a negative error code.
+STBDDEF int stb_build_quantize_lut(unsigned char lut[STB_QUANT_LUT_ENTRIES], int levels);
+
+// Reduce colors of an interleaved image with `channels` bytes per pixel
+// (1..4; the last channel of a 2- or 4-channel image is treated as alpha and
+// copied through). src and dst may point at the same buffer (in-place).
+// bayer_size (2/4/8) and strength (0..100 percent) apply only to
+// STB_PIXEL_BAYER. Returns STB_PIXEL_OK or a negative error code.
+STBDDEF int stb_reduce_palette(unsigned char *dst, const unsigned char *src,
+                               int width, int height, int channels,
+                               const unsigned char lut[STB_QUANT_LUT_ENTRIES],
+                               int mode, int bayer_size, int strength);
+
 #define STB_COMPRESS_DXT_BLOCK
 
 #ifdef __cplusplus
@@ -625,6 +664,181 @@ void stb_compress_bc5_block(unsigned char *dest, const unsigned char *src)
 {
    stb__CompressAlphaBlock(dest,(unsigned char*) src,2);
    stb__CompressAlphaBlock(dest + 8,(unsigned char*) src+1,2);
+}
+
+// ----------------------------------------------------------------------------
+// Pixel-art color reduction (see the public declarations above).
+
+int stb_build_quantize_lut(unsigned char lut[STB_QUANT_LUT_ENTRIES], int levels)
+{
+   int i;
+   if (lut == NULL)
+      return STB_PIXEL_ERR_POINTER;
+   if (levels < 2 || levels > 256)
+      return STB_PIXEL_ERR_LEVELS;
+
+   // Evenly spaced representative levels chosen by midpoint thresholds, the
+   // same unbiased convention as stb__Quantize5/6. Each table entry stores the
+   // representative byte value (not the level index) so output still spans the
+   // full 0..255 range. Indexing all 256 input values once keeps the hot
+   // per-pixel path to a single table lookup.
+   for (i = 0; i < STB_QUANT_LUT_ENTRIES; ++i)
+   {
+      int level = (i * (2 * levels - 2) + 255) / (2 * 255);
+      lut[i] = (unsigned char) ((level * 255 + (levels - 1) / 2) / (levels - 1));
+   }
+
+   return STB_PIXEL_OK;
+}
+
+static int stb__clamp_int(int v, int lo, int hi)
+{
+   if (v < lo) return lo;
+   if (v > hi) return hi;
+   return v;
+}
+
+// Standard Bayer threshold matrix of order 2, 4 or 8; every entry holds the
+// threshold in [0, size^2) (i.e. matrix index *without* the /size^2 scale).
+static int stb__bayer_threshold(const int *matrix, int size, int x, int y)
+{
+   return matrix[(y & (size - 1)) * size + (x & (size - 1))];
+}
+
+static void stb__build_bayer_matrix(int *matrix, int size)
+{
+   int n = 2, x, y;
+
+   matrix[0] = 0;
+   while (n <= size) {
+      int half = n / 2;
+      for (y = n - 1; y >= 0; --y) {
+         for (x = n - 1; x >= 0; --x) {
+            int base = matrix[(y % half) * half + (x % half)];
+            int value;
+            if (x < half && y < half)
+               value = 4 * base;
+            else if (x >= half && y >= half)
+               value = 4 * base + 1;
+            else if (x >= half)
+               value = 4 * base + 2;
+            else
+               value = 4 * base + 3;
+            matrix[y * n + x] = value;
+         }
+      }
+      n *= 2;
+   }
+}
+
+int stb_reduce_palette(unsigned char *dst, const unsigned char *src,
+                       int width, int height, int channels,
+                       const unsigned char lut[STB_QUANT_LUT_ENTRIES],
+                       int mode, int bayer_size, int strength)
+{
+   int bayer_matrix[64]; // largest supported order is 8 (8*8 entries)
+   int color_channels;
+   int total, pixel, channel;
+
+   if (width <= 0 || height <= 0)
+      return STB_PIXEL_ERR_DIMENSIONS;
+   if (channels < 1 || channels > 4)
+      return STB_PIXEL_ERR_CHANNELS;
+   if (dst == NULL || src == NULL || lut == NULL)
+      return STB_PIXEL_ERR_POINTER;
+   if (mode < STB_PIXEL_QUANTIZE || mode > STB_PIXEL_ERROR_DIFFUSE)
+      return STB_PIXEL_ERR_MODE;
+   if (strength < 0 || strength > 100)
+      return STB_PIXEL_ERR_STRENGTH;
+   if (mode == STB_PIXEL_BAYER) {
+      if (bayer_size != 2 && bayer_size != 4 && bayer_size != 8)
+         return STB_PIXEL_ERR_BAYER;
+      stb__build_bayer_matrix(bayer_matrix, bayer_size);
+   }
+
+   // Grayscale (1) and gray+alpha (2) reduce one channel; RGB/RGBA reduce three.
+   color_channels = channels >= 3 ? 3 : 1;
+   total = width * height;
+
+   if (mode == STB_PIXEL_ERROR_DIFFUSE) {
+      // Floyd-Steinberg with two per-channel error rows (current and next).
+      // All arithmetic is integer and scanline-ordered, hence deterministic.
+      int row_stride = width * color_channels;
+      int *cur_err;
+      int *next_err;
+      int *swap_tmp;
+
+      cur_err = (int *) malloc((size_t) row_stride * sizeof(int));
+      next_err = (int *) malloc((size_t) row_stride * sizeof(int));
+      if (cur_err == NULL || next_err == NULL) {
+         free(cur_err);
+         free(next_err);
+         return STB_PIXEL_ERR_NOMEM;
+      }
+      memset(cur_err, 0, (size_t) row_stride * sizeof(int));
+      memset(next_err, 0, (size_t) row_stride * sizeof(int));
+
+      for (pixel = 0; pixel < total; ++pixel) {
+         int x = pixel % width;
+         for (channel = 0; channel < channels; ++channel) {
+            int src_index = (pixel * channels) + channel;
+            if (channel >= color_channels) {
+               dst[src_index] = src[src_index]; // alpha passes through
+               continue;
+            }
+            {
+               int err_index = x * color_channels + channel;
+               int adjusted = stb__clamp_int((int) src[src_index] + cur_err[err_index], 0, 255);
+               int quantized = lut[adjusted];
+               int diff = adjusted - quantized;
+
+               dst[src_index] = (unsigned char) quantized;
+
+               if (x + 1 < width)
+                  cur_err[err_index + color_channels] += (diff * 7) / 16;
+               if (x > 0)
+                  next_err[err_index - color_channels] += (diff * 3) / 16;
+               next_err[err_index] += (diff * 5) / 16;
+               if (x + 1 < width)
+                  next_err[err_index + color_channels] += diff / 16;
+            }
+         }
+         if (x == width - 1) {
+            swap_tmp = cur_err;
+            cur_err = next_err;
+            next_err = swap_tmp;
+            memset(next_err, 0, (size_t) row_stride * sizeof(int));
+         }
+      }
+      free(cur_err);
+      free(next_err);
+      return STB_PIXEL_OK;
+   }
+
+   for (pixel = 0; pixel < total; ++pixel) {
+      int x = pixel % width;
+      int y = pixel / width;
+      for (channel = 0; channel < channels; ++channel) {
+         int src_index = (pixel * channels) + channel;
+         int value = src[src_index];
+         if (channel >= color_channels) {
+            dst[src_index] = (unsigned char) value; // alpha passes through
+            continue;
+         }
+         if (mode == STB_PIXEL_BAYER && strength != 0) {
+            int area = bayer_size * bayer_size;
+            int threshold = stb__bayer_threshold(bayer_matrix, bayer_size, x, y);
+            // threshold centers on 0; scale the perturbation by strength and
+            // by a quantization step so full strength spans one LUT bin.
+            int perturb = ((threshold * 2 - area + 1) * 255 * strength)
+                        / (2 * (area - 1) * 100);
+            value = stb__clamp_int(value + perturb, 0, 255);
+         }
+         dst[src_index] = lut[value];
+      }
+   }
+
+   return STB_PIXEL_OK;
 }
 #endif // STB_DXT_IMPLEMENTATION
 
