@@ -530,6 +530,31 @@ STBIDEF const char *stbi_failure_reason  (void);
 // free the loaded image -- this is just free()
 STBIDEF void     stbi_image_free      (void *retval_from_stbi_load);
 
+// ---------------------------------------------------------------------------
+// Retro/vintage color processing
+//
+// All buffers hold ordinary 8-bit sRGB (gamma-encoded) pixels, interleaved
+// RGB or RGBA, exactly the layout produced by stbi_load*() with 3 or 4
+// components. Every routine below keeps the pixels in gamma space end to
+// end: no decode to linear light is ever performed, so the sepia matrix and
+// the layer compositing multiply/add run on the encoded values rather than
+// on accidentally-linearized values.
+//
+// 'strength' / 'opacity' must lie in [0,1]. Strength 0 is a no-op and
+// strength 1 applies the full sepia matrix; values outside the range are
+// rejected (the buffer is left untouched and the routine returns -1).
+//
+// stbi_sepia_pixel applies the configurable sepia matrix to a single RGB
+// triplet and is the per-pixel primitive used by the image-wide variant.
+// stbi_sepia_image processes an entire image in place.
+// stbi_overlay_gamma composites 'over' on top of 'base' in gamma space.
+STBIDEF void   stbi_sepia_pixel(unsigned char r, unsigned char g, unsigned char b,
+                                float strength,
+                                unsigned char *out_r, unsigned char *out_g, unsigned char *out_b);
+STBIDEF int    stbi_sepia_image(unsigned char *pixels, int x, int y, int comp, float strength);
+STBIDEF int    stbi_overlay_gamma(unsigned char *base, unsigned char const *over,
+                                  int x, int y, int comp, float opacity);
+
 // get image dimensions, components, etc without fully decoding (new api)
 typedef struct
 {
@@ -7549,6 +7574,119 @@ STBIDEF int stbi_is_16_bit_from_callbacks(stbi_io_callbacks const *c, void *user
    r = stbi__info2_main(&s);
    stbi__stop(&s);
    return r.type != STBI_type_unsupported && r.is_16_bit;
+}
+
+// ---------------------------------------------------------------------------
+// Retro/vintage sepia processing and gamma-space layer compositing
+//
+// Pixels are stored as 8-bit sRGB, i.e. gamma-encoded, values. The classic
+// sepia coefficients are defined for these encoded values, so the matrix is
+// evaluated directly on the bytes; decoding to linear light first would
+// shift the hue and darken the result. Layer compositing uses the same
+// encoded space for the same reason.
+
+// Canonical sepia matrix (rows R,G,B; columns source R,G,B), applied in
+// gamma/sRGB space. Each row sums to 1, preserving the encoded luminance.
+#define STBI__SEPIA_RR 0.393f
+#define STBI__SEPIA_RG 0.769f
+#define STBI__SEPIA_RB 0.189f
+#define STBI__SEPIA_GR 0.349f
+#define STBI__SEPIA_GG 0.686f
+#define STBI__SEPIA_GB 0.168f
+#define STBI__SEPIA_BR 0.272f
+#define STBI__SEPIA_BG 0.534f
+#define STBI__SEPIA_BB 0.131f
+
+static unsigned char stbi__clamp_255(float v)
+{
+   if (v < 0.0f) v = 0.0f;
+   if (v > 255.0f) v = 255.0f;
+   return (unsigned char) (v + 0.5f);
+}
+
+STBIDEF void stbi_sepia_pixel(unsigned char r, unsigned char g, unsigned char b,
+                              float strength,
+                              unsigned char *out_r, unsigned char *out_g, unsigned char *out_b)
+{
+   // Blend between the identity matrix and the full sepia matrix by
+   // 'strength', so strength 0 reproduces the input exactly.
+   float rr = (1.0f - strength) + strength * STBI__SEPIA_RR;
+   float rg =                   strength * STBI__SEPIA_RG;
+   float rb =                   strength * STBI__SEPIA_RB;
+   float gr =                   strength * STBI__SEPIA_GR;
+   float gg = (1.0f - strength) + strength * STBI__SEPIA_GG;
+   float gb =                   strength * STBI__SEPIA_GB;
+   float br =                   strength * STBI__SEPIA_BR;
+   float bg =                   strength * STBI__SEPIA_BG;
+   float bb = (1.0f - strength) + strength * STBI__SEPIA_BB;
+
+   float fr = (float)r;
+   float fg = (float)g;
+   float fb = (float)b;
+
+   *out_r = stbi__clamp_255(fr * rr + fg * rg + fb * rb);
+   *out_g = stbi__clamp_255(fr * gr + fg * gg + fb * gb);
+   *out_b = stbi__clamp_255(fr * br + fg * bg + fb * bb);
+}
+
+STBIDEF int stbi_sepia_image(unsigned char *pixels, int x, int y, int comp, float strength)
+{
+   int count, i;
+   if (pixels == NULL || x <= 0 || y <= 0 || (comp != 3 && comp != 4))
+   {
+      (void) stbi__err("sepia bad argument", "Sepia: bad argument");
+      return -1;
+   }
+   // NaN and out-of-range strengths are rejected; the buffer is not touched.
+   if (!(strength >= 0.0f && strength <= 1.0f))
+   {
+      (void) stbi__err("sepia strength out of range", "Sepia: strength must be in [0,1]");
+      return -1;
+   }
+
+   count = x * y;
+   for (i = 0; i < count; ++i) {
+      unsigned char *px = pixels + (size_t) i * comp;
+      stbi_sepia_pixel(px[0], px[1], px[2], strength, &px[0], &px[1], &px[2]);
+      // alpha (comp == 4) is left untouched
+   }
+   return 0;
+}
+
+// Source-over alpha compositing performed directly on the gamma-encoded
+// (sRGB) bytes:  out = over*a + base*(1-a). 'opacity' scales the over-layer
+// alpha. Doing the same multiply/add after decoding to linear light would be
+// physically more accurate, but per the retro pipeline's contract all math
+// stays in gamma space here.
+STBIDEF int stbi_overlay_gamma(unsigned char *base, unsigned char const *over,
+                               int x, int y, int comp, float opacity)
+{
+   int count, i, k;
+   if (base == NULL || over == NULL || x <= 0 || y <= 0 || (comp != 3 && comp != 4))
+   {
+      (void) stbi__err("overlay bad argument", "Overlay: bad argument");
+      return -1;
+   }
+   if (!(opacity >= 0.0f && opacity <= 1.0f))
+   {
+      (void) stbi__err("overlay opacity out of range", "Overlay: opacity must be in [0,1]");
+      return -1;
+   }
+
+   count = x * y;
+   for (i = 0; i < count; ++i) {
+      unsigned char *bp = base  + (size_t) i * comp;
+      unsigned char const *op = over + (size_t) i * comp;
+      // RGBA layers use their own alpha; RGB layers are treated as opaque
+      // and are blended solely by 'opacity'.
+      float alpha = opacity * (comp == 4 ? op[3] / 255.0f : 1.0f);
+      float inv = 1.0f - alpha;
+      for (k = 0; k < 3; ++k)
+         bp[k] = stbi__clamp_255(op[k] * alpha + bp[k] * inv);
+      if (comp == 4)
+         bp[3] = stbi__clamp_255(op[3] * alpha + bp[3] * inv);
+   }
+   return 0;
 }
 
 #endif // STB_IMAGE_IMPLEMENTATION
