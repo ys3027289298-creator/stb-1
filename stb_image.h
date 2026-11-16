@@ -552,6 +552,58 @@ STBIDEF stbi_info_res stbi_info2          (char const *filename);
 STBIDEF stbi_info_res stbi_info2_from_file(FILE *f);
 #endif
 
+// zero-copy pixel view
+//
+// Some formats store pixels uncompressed, row by row, so there is no need to
+// allocate or decode anything: the pixels can be viewed directly in the
+// caller's memory buffer. stbi_view_from_memory() returns such a view for
+// binaries PGM/PPM (maxval 255), uncompressed TGA, and uncompressed 24-bit BMP.
+// For every other input it falls back to a normal decode and reports why the
+// view was impossible; the fallback result is a regular stbi_load allocation.
+//
+// A view is described by:
+//    pixels  - first byte of the top-left pixel of the image as it should be
+//              displayed. Address of pixel (px,py) is pixels + py*stride + px*comp.
+//    comp    - channels per pixel (1..4)
+//    stride  - bytes from one row to the next. This may be negative when the
+//              rows are stored bottom-up, and may be larger than px*comp when
+//              the stored rows are padded (e.g. BMP rows padded to 4 bytes).
+//    channel_order - STBI_view_order_rgb or STBI_view_order_bgr. TGA and BMP
+//              store BGR(A) natively; no copy is made to reorder channels.
+//
+// Lifetime:
+//    copied == 0: pixels points into the buffer passed to stbi_view_from_memory.
+//                 It is NOT owned by stb_image and must not be freed with
+//                 stbi_image_free. The buffer must stay alive and unmodified
+//                 for as long as the view is used. The view API never writes
+//                 to the buffer, so read-only memory works.
+//    copied == 1: the view could not be formed; pixels is an ordinary decoded
+//                 image that must be freed with stbi_image_free, after which
+//                 the input buffer can be released.
+//    copied == 1 with pixels == NULL means the fallback decode also failed;
+//    `reason` then explains both failures.
+enum
+{
+   STBI_view_order_rgb = 0,
+   STBI_view_order_bgr = 1
+};
+
+typedef struct
+{
+   const stbi_uc *pixels;
+   int x;
+   int y;
+   int comp;
+   int bits_per_channel;   // currently always 8; views are not made for 16-bit data
+   int stride;             // in bytes; may be negative for bottom-up rows
+   int channel_order;      // STBI_view_order_rgb / STBI_view_order_bgr
+   int type;               // STBI_type_*, as reported by stbi_info2
+   int copied;             // 0 = zero-copy view, 1 = decoded fallback (free it)
+   const char *reason;     // NULL for a view, otherwise why a copy happened/failed
+} stbi_view;
+
+STBIDEF stbi_view stbi_view_from_memory(stbi_uc const *buffer, int len, int desired_channels);
+
 // get image dimensions & components without fully decoding (old api)
 STBIDEF int      stbi_info_from_memory(stbi_uc const *buffer, int len, int *x, int *y, int *comp);
 STBIDEF int      stbi_info_from_callbacks(stbi_io_callbacks const *clbk, void *user, int *x, int *y, int *comp);
@@ -7549,6 +7601,235 @@ STBIDEF int stbi_is_16_bit_from_callbacks(stbi_io_callbacks const *c, void *user
    r = stbi__info2_main(&s);
    stbi__stop(&s);
    return r.type != STBI_type_unsupported && r.is_16_bit;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+//  zero-copy pixel views
+//
+//  The formats we can view in place all store pixels as rows of raw 8-bit
+//  samples. The only work left is to describe where the first pixel is, how
+//  far apart the rows are, and in what channel order the samples are stored.
+//  Nothing is copied and the input buffer is never written to.
+//
+
+static stbi_view stbi__view_empty(int type, const char *why)
+{
+   stbi_view v;
+   memset(&v, 0, sizeof(v));
+   v.type = type;
+   v.bits_per_channel = 8;
+   v.channel_order = STBI_view_order_rgb;
+   v.reason = why;
+   v.copied = 1;
+   return v;
+}
+
+static stbi_view stbi__view_fallback(stbi_uc const *buffer, int len, int desired_channels, int type, const char *why)
+{
+   stbi_view v = stbi__view_empty(type, why);
+   int x = 0, y = 0, comp = 0;
+   stbi_uc *pixels = stbi_load_from_memory(buffer, len, &x, &y, &comp, desired_channels);
+   v.pixels = pixels;
+   if (pixels == NULL) {
+      // both the view and the decode failed; the decode failure is the more
+      // useful one to report
+      v.reason = stbi_failure_reason();
+      return v;
+   }
+   v.x = x;
+   v.y = y;
+   v.comp = desired_channels ? desired_channels : comp; // what the decoded pixels actually contain
+   v.stride = x * v.comp; // decoded images are tightly packed, top row first
+   return v;
+}
+
+// data_off is the byte offset of the first stored row in buffer, rowbytes is
+// the distance between two stored rows, top_down says whether the first stored
+// row is the top row. The in-place result is always described in display order:
+// pixels is the top-left pixel and stride walks towards the bottom row.
+#if !defined(STBI_NO_BMP) || !defined(STBI_NO_PNM) || !defined(STBI_NO_TGA)
+static stbi_view stbi__view_make(stbi_uc const *buffer, int len, int desired_channels,
+                                 int data_off, int w, int h, int comp, int rowbytes,
+                                 int top_down, int channel_order, int type)
+{
+   stbi_view v = stbi__view_empty(type, NULL);
+   size_t avail, last_row_bytes, rows_before_last;
+   v.x = w;
+   v.y = h;
+   v.comp = comp;
+   v.channel_order = channel_order;
+
+   if (desired_channels != 0 && desired_channels != comp)
+      return stbi__view_fallback(buffer, len, desired_channels, type,
+                                 "requested channel count requires a conversion");
+   if (w <= 0 || h <= 0 || rowbytes <= 0)
+      return stbi__view_fallback(buffer, len, desired_channels, type, "empty image");
+   if (data_off < 0 || data_off > len)
+      return stbi__view_fallback(buffer, len, desired_channels, type, "pixel data is truncated");
+
+   // the last row may lose its padding; everything before it must be complete
+   avail = (size_t) (len - data_off);
+   last_row_bytes = (size_t) w * (size_t) comp;
+   rows_before_last = (size_t) (h - 1);
+   if (rows_before_last > avail / (size_t) rowbytes ||
+       avail - rows_before_last * (size_t) rowbytes < last_row_bytes)
+      return stbi__view_fallback(buffer, len, desired_channels, type, "pixel data is truncated");
+
+   if (stbi__vertically_flip_on_load)
+      top_down = !top_down;
+
+   if (top_down) {
+      v.pixels = buffer + data_off;
+      v.stride = rowbytes;
+   } else {
+      v.pixels = buffer + data_off + rows_before_last * (size_t) rowbytes;
+      v.stride = -rowbytes;
+   }
+   v.copied = 0;
+   v.reason = NULL;
+   return v;
+}
+#endif
+
+STBIDEF stbi_view stbi_view_from_memory(stbi_uc const *buffer, int len, int desired_channels)
+{
+   stbi_view v;
+   stbi__context s;
+
+   v = stbi__view_empty(STBI_type_unsupported, NULL);
+   if (buffer == NULL || len <= 0) {
+      v.reason = "no input data";
+      return v;
+   }
+   // the format probes below mirror stbi__load_main; an unusable request is
+   // still reported with the format we detected
+   if (desired_channels < 0 || desired_channels > 4) {
+      stbi__start_mem(&s, buffer, len);
+      v.type = stbi__info2_main(&s).type;
+      return stbi__view_fallback(buffer, len, desired_channels, v.type, "bad desired_channels");
+   }
+
+   stbi__start_mem(&s, buffer, len);
+
+   // Probe in the same order as stbi__load_main, so the format (and therefore
+   // the refusal reason) matches what a decode of the same buffer would use.
+   #ifndef STBI_NO_PNG
+   if (stbi__png_test(&s))
+      return stbi__view_fallback(buffer, len, desired_channels, STBI_type_png, "PNG data is compressed");
+   #endif
+   #ifndef STBI_NO_BMP
+   if (stbi__bmp_test(&s)) {
+      stbi__bmp_data info;
+      int w, h, rowbytes, top_down;
+      info.all_a = 0;
+      if (!stbi__bmp_parse_header(&s, &info))
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_bmp, stbi_failure_reason());
+      if (info.bpp != 24)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_bmp,
+                                    "BMP is not uncompressed 24-bit");
+      // 24-bit BMPs are only reported as 3-channel when the alpha mask is
+      // absent or fully opaque; other masks would change the decode result
+      if (info.ma != 0 && info.ma != 0xff000000u)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_bmp,
+                                    "BMP has a non-opaque alpha mask");
+      w = (int) s.img_x;
+      h = (int) s.img_y;
+      if (h > STBI_MAX_DIMENSIONS || h < -STBI_MAX_DIMENSIONS ||
+          w < 0 || w > STBI_MAX_DIMENSIONS)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_bmp, "BMP dimensions are invalid");
+      top_down = h < 0;
+      if (h < 0) h = -h;
+      if (info.offset < info.hsz + info.extra_read)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_bmp, "BMP pixel offset is invalid");
+      rowbytes = (3 * w + 3) & ~3; // rows are padded to a 4-byte boundary
+      return stbi__view_make(buffer, len, desired_channels, info.offset, w, h, 3, rowbytes,
+                             top_down, STBI_view_order_bgr, STBI_type_bmp);
+   }
+   #endif
+   #ifndef STBI_NO_GIF
+   if (stbi__gif_test(&s))
+      return stbi__view_fallback(buffer, len, desired_channels, STBI_type_gif, "GIF data is compressed");
+   #endif
+   #ifndef STBI_NO_PSD
+   if (stbi__psd_test(&s))
+      return stbi__view_fallback(buffer, len, desired_channels, STBI_type_psd, "PSD data is compressed");
+   #endif
+   #ifndef STBI_NO_JPEG
+   if (stbi__jpeg_test(&s))
+      return stbi__view_fallback(buffer, len, desired_channels, STBI_type_jpeg, "JPEG data is compressed");
+   #endif
+   #ifndef STBI_NO_PNM
+   if (stbi__pnm_test(&s)) {
+      int maxv = 0, isascii = 0, bits, data_off, comp;
+      bits = stbi__pnm_info_internal(&s, (int *) &s.img_x, (int *) &s.img_y, (int *) &s.img_n, &maxv, &isascii);
+      if (!bits)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_pnm, stbi_failure_reason());
+      if (isascii)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_pnm, "ASCII-encoded PNM must be parsed");
+      if (bits != 8)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_pnm,
+                                    "16-bit PNM samples are not directly viewable as 8-bit");
+      if (maxv != 255)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_pnm,
+                                    "PNM maxval is not 255, samples must be rescaled");
+      if (s.img_x > STBI_MAX_DIMENSIONS || s.img_y > STBI_MAX_DIMENSIONS)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_pnm, "PNM dimensions are too large");
+      comp = (int) s.img_n;
+      // stbi__pnm_info_internal just consumed the whitespace after maxval,
+      // which is exactly where the binary samples start.
+      data_off = (int) (s.img_buffer - buffer);
+      return stbi__view_make(buffer, len, desired_channels, data_off,
+                             (int) s.img_x, (int) s.img_y, comp, (int) s.img_x * comp,
+                             1, STBI_view_order_rgb, STBI_type_pnm);
+   }
+   #endif
+   #ifndef STBI_NO_HDR
+   if (stbi__hdr_test(&s))
+      return stbi__view_fallback(buffer, len, desired_channels, STBI_type_hdr,
+                                 "HDR stores RGBE pixels that must be converted to floats");
+   #endif
+   #ifndef STBI_NO_TGA
+   if (stbi__tga_test(&s)) {
+      int tga_offset, tga_indexed, tga_image_type, tga_width, tga_height;
+      int tga_bits_per_pixel, tga_desc, comp, rowbytes, top_down;
+      tga_offset       = stbi__get8(&s);  // ID field length: pixel data follows it
+      tga_indexed      = stbi__get8(&s);
+      tga_image_type   = stbi__get8(&s);
+      stbi__get16le(&s);                 // color map origin
+      stbi__get16le(&s);                 // color map length
+      stbi__get8(&s);                    // color map bits per entry
+      stbi__get16le(&s);                 // image x origin
+      stbi__get16le(&s);                 // image y origin
+      tga_width        = stbi__get16le(&s);
+      tga_height       = stbi__get16le(&s);
+      tga_bits_per_pixel = stbi__get8(&s);
+      tga_desc         = stbi__get8(&s);
+      stbi__rewind(&s);
+
+      if (tga_indexed)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_tga,
+                                    "indexed TGA needs a palette lookup");
+      if (tga_image_type >= 8)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_tga, "RLE-compressed TGA");
+      if (tga_image_type != 2 && tga_image_type != 3)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_tga, "unsupported TGA image type");
+      if (tga_bits_per_pixel != 8 && tga_bits_per_pixel != 24 && tga_bits_per_pixel != 32)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_tga,
+                                    "TGA pixel format needs conversion (only 8/24/32-bit true-color is direct)");
+      if (tga_desc & 0x10)
+         return stbi__view_fallback(buffer, len, desired_channels, STBI_type_tga,
+                                    "TGA stores pixels right-to-left");
+      comp = (tga_bits_per_pixel == 8) ? 1 : (tga_bits_per_pixel == 24) ? 3 : 4;
+      top_down = (tga_desc & 0x20) != 0;
+      rowbytes = tga_width * comp;
+      return stbi__view_make(buffer, len, desired_channels, 18 + tga_offset,
+                             tga_width, tga_height, comp, rowbytes, top_down,
+                             comp >= 3 ? STBI_view_order_bgr : STBI_view_order_rgb, STBI_type_tga);
+   }
+   #endif
+
+   return stbi__view_fallback(buffer, len, desired_channels, STBI_type_unsupported, "unknown image type");
 }
 
 #endif // STB_IMAGE_IMPLEMENTATION
