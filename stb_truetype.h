@@ -4124,6 +4124,357 @@ STBTT_DEF void stbtt_PackSetSkipMissingCodepoints(stbtt_pack_context *spc, int s
 
 #define STBTT__OVER_MASK  (STBTT_MAX_OVERSAMPLE-1)
 
+//////////////////////////////////////////////////////////////////////////////
+//
+// Separable convolution engine (internal)
+//
+// Shared 1D convolution core for blur / stroke (outline) style effects.
+// The kernel is supplied as a 1D array of 2*radius+1 coefficients; 2D
+// filtering is performed as two separable 1D passes. Three edge (boundary)
+// strategies are supported, and kernels with radius > STBTT__CONV_SMALL_RADIUS
+// avoid the direct O(n*radius) loop: uniform (box) kernels use an O(n)
+// sliding-window running sum, arbitrary kernels use an FFT-based convolution.
+//
+// All functions return 1 on success and 0 on error (empty kernel, illegal
+// radius, illegal edge mode, bad dimensions, or allocation failure).
+
+#define STBTT__CONV_EDGE_ZERO      0   // pad with zeros outside the signal
+#define STBTT__CONV_EDGE_REPLICATE 1   // clamp to the nearest edge sample
+#define STBTT__CONV_EDGE_WRAP      2   // wrap around (periodic signal)
+
+#define STBTT__CONV_SMALL_RADIUS   8   // radius above which large-kernel paths are used
+
+#define STBTT__CONV_PI  3.14159265358979323846
+
+// the engine is infrastructure for blur/stroke effects; until those call it,
+// keep -Wunused-function quiet for translation units that don't use it yet
+#if defined(__GNUC__) || defined(__clang__)
+#define STBTT__CONV_UNUSED __attribute__((unused))
+#else
+#define STBTT__CONV_UNUSED
+#endif
+
+typedef struct
+{
+   double re;
+   double im;
+} stbtt__conv_complex;
+
+// map an index outside [0,n) according to the edge strategy; returns the
+// mapped index and sets *is_zero to 1 for samples that read as zero
+static int stbtt__conv_edge_map(int i, int n, int edge_mode, int *is_zero)
+{
+   if (i >= 0 && i < n) {
+      *is_zero = 0;
+      return i;
+   }
+   switch (edge_mode) {
+      case STBTT__CONV_EDGE_ZERO:
+         *is_zero = 1;
+         return 0;
+      case STBTT__CONV_EDGE_REPLICATE:
+         *is_zero = 0;
+         return i < 0 ? 0 : n - 1;
+      default: // STBTT__CONV_EDGE_WRAP
+         *is_zero = 0;
+         i %= n;
+         return i < 0 ? i + n : i;
+   }
+}
+
+static int stbtt__conv_next_pow2(int x)
+{
+   int p = 1;
+   while (p < x && p <= (1 << 30))
+      p <<= 1;
+   return p;
+}
+
+// iterative radix-2 FFT over n (power of two) complex values
+static void stbtt__conv_fft(stbtt__conv_complex *a, int n, int inverse)
+{
+   int i, j, len;
+   int j_rev = 0;
+   for (i = 1; i < n; ++i) {
+      int bit = n >> 1;
+      for (; j_rev & bit; bit >>= 1)
+         j_rev ^= bit;
+      j_rev ^= bit;
+      if (i < j_rev) {
+         stbtt__conv_complex tmp = a[i];
+         a[i] = a[j_rev];
+         a[j_rev] = tmp;
+      }
+   }
+   for (len = 2; len <= n; len <<= 1) {
+      double ang = 2.0 * STBTT__CONV_PI / len;
+      double wlen_re, wlen_im;
+      int half = len >> 1;
+      if (!inverse)
+         ang = -ang;
+      wlen_re = cos(ang);
+      wlen_im = sin(ang);
+      for (i = 0; i < n; i += len) {
+         double w_re = 1.0, w_im = 0.0;
+         for (j = 0; j < half; ++j) {
+            int u = i + j;
+            int v = i + j + half;
+            double v_re = a[v].re * w_re - a[v].im * w_im;
+            double v_im = a[v].re * w_im + a[v].im * w_re;
+            double nre, nim;
+            a[v].re = a[u].re - v_re;
+            a[v].im = a[u].im - v_im;
+            a[u].re += v_re;
+            a[u].im += v_im;
+            nre = w_re * wlen_re - w_im * wlen_im;
+            nim = w_re * wlen_im + w_im * wlen_re;
+            w_re = nre;
+            w_im = nim;
+         }
+      }
+   }
+   if (inverse) {
+      double inv_n = 1.0 / n;
+      for (i = 0; i < n; ++i) {
+         a[i].re *= inv_n;
+         a[i].im *= inv_n;
+      }
+   }
+}
+
+// validate common convolution arguments; returns 1 if usable
+static int stbtt__conv_check_args(int n, const float *kernel, int radius, int edge_mode)
+{
+   if (n < 1)
+      return 0;
+   if (kernel == 0)
+      return 0;                       // empty kernel
+   if (radius < 0)
+      return 0;                       // illegal radius
+   if (radius > (0x7fffffff - n) / 2)
+      return 0;                       // radius so large the indexing overflows
+   if (edge_mode < STBTT__CONV_EDGE_ZERO || edge_mode > STBTT__CONV_EDGE_WRAP)
+      return 0;
+   return 1;
+}
+
+// large-kernel path for uniform (box) kernels: out[i] = coeff * (sum of the
+// 2*radius+1 edge-mapped samples centered on i), computed with a running sum
+static int stbtt__convolve_1d_sliding(float *data, int n, int stride, float coeff, int radius, int edge_mode)
+{
+   int m = n + 2 * radius;
+   int len = 2 * radius + 1;
+   double *ext = (double *) STBTT_malloc(sizeof(double) * m, 0);
+   float *tmp;
+   double run;
+   int i;
+   if (ext == 0)
+      return 0;
+   for (i = 0; i < m; ++i) {
+      int is_zero;
+      int idx = stbtt__conv_edge_map(i - radius, n, edge_mode, &is_zero);
+      ext[i] = is_zero ? 0.0 : (double) data[idx * stride];
+   }
+   tmp = (float *) STBTT_malloc(sizeof(float) * n, 0);
+   if (tmp == 0) {
+      STBTT_free(ext, 0);
+      return 0;
+   }
+   run = 0.0;
+   for (i = 0; i < len; ++i)
+      run += ext[i];
+   tmp[0] = (float) (coeff * run);
+   for (i = 1; i < n; ++i) {
+      run += ext[i + len - 1] - ext[i - 1];
+      tmp[i] = (float) (coeff * run);
+   }
+   for (i = 0; i < n; ++i)
+      data[i * stride] = tmp[i];
+   STBTT_free(tmp, 0);
+   STBTT_free(ext, 0);
+   return 1;
+}
+
+// large-kernel path for arbitrary kernels: FFT-based convolution matching the
+// per-pixel definition out[i] = sum_k kernel[radius+k] * edge_map(i+k)
+static int stbtt__convolve_1d_fft(float *data, int n, int stride, const float *kernel, int radius, int edge_mode)
+{
+   int len = 2 * radius + 1;
+   int i;
+   int ok = 0;
+   stbtt__conv_complex *fa = 0;
+   stbtt__conv_complex *fb = 0;
+
+   if (edge_mode == STBTT__CONV_EDGE_WRAP) {
+      // periodic signal: fold the kernel modulo n, linear-convolve, then
+      // fold the result back modulo n
+      int size;
+      if (n > (0x7fffffff - len) / 2)
+         return 0;
+      size = stbtt__conv_next_pow2(2 * n - 1);
+      if (size < 2 * n - 1)
+         return 0;
+      fa = (stbtt__conv_complex *) STBTT_malloc(sizeof(stbtt__conv_complex) * size, 0);
+      fb = (stbtt__conv_complex *) STBTT_malloc(sizeof(stbtt__conv_complex) * size, 0);
+      if (fa == 0 || fb == 0)
+         goto done;
+      for (i = 0; i < size; ++i) {
+         fa[i].re = fa[i].im = 0.0;
+         fb[i].re = fb[i].im = 0.0;
+      }
+      for (i = 0; i < n; ++i)
+         fa[i].re = (double) data[i * stride];
+      {
+         int k;
+         for (k = -radius; k <= radius; ++k) {
+            int d = (-k) % n;
+            if (d < 0)
+               d += n;
+            fb[d].re += (double) kernel[radius + k];
+         }
+      }
+      stbtt__conv_fft(fa, size, 0);
+      stbtt__conv_fft(fb, size, 0);
+      for (i = 0; i < size; ++i) {
+         double re = fa[i].re * fb[i].re - fa[i].im * fb[i].im;
+         double im = fa[i].re * fb[i].im + fa[i].im * fb[i].re;
+         fa[i].re = re;
+         fa[i].im = im;
+      }
+      stbtt__conv_fft(fa, size, 1);
+      for (i = 0; i < n; ++i) {
+         double v = fa[i].re;
+         if (i + n <= 2 * n - 2)
+            v += fa[i + n].re;
+         data[i * stride] = (float) v;
+      }
+      ok = 1;
+   } else {
+      // zero / replicate: extend the signal by radius samples on both sides,
+      // then linear-convolve with the reversed kernel
+      int m, size;
+      if (radius > (0x7fffffff - n) / 2)
+         return 0;
+      m = n + 2 * radius;
+      if (m > 0x7fffffff - len)
+         return 0;
+      size = stbtt__conv_next_pow2(m + len - 1);
+      if (size < m + len - 1)
+         return 0;
+      fa = (stbtt__conv_complex *) STBTT_malloc(sizeof(stbtt__conv_complex) * size, 0);
+      fb = (stbtt__conv_complex *) STBTT_malloc(sizeof(stbtt__conv_complex) * size, 0);
+      if (fa == 0 || fb == 0)
+         goto done;
+      for (i = 0; i < size; ++i) {
+         fa[i].re = fa[i].im = 0.0;
+         fb[i].re = fb[i].im = 0.0;
+      }
+      for (i = 0; i < m; ++i) {
+         int is_zero;
+         int idx = stbtt__conv_edge_map(i - radius, n, edge_mode, &is_zero);
+         fa[i].re = is_zero ? 0.0 : (double) data[idx * stride];
+      }
+      for (i = 0; i < len; ++i)
+         fb[i].re = (double) kernel[len - 1 - i];
+      stbtt__conv_fft(fa, size, 0);
+      stbtt__conv_fft(fb, size, 0);
+      for (i = 0; i < size; ++i) {
+         double re = fa[i].re * fb[i].re - fa[i].im * fb[i].im;
+         double im = fa[i].re * fb[i].im + fa[i].im * fb[i].re;
+         fa[i].re = re;
+         fa[i].im = im;
+      }
+      stbtt__conv_fft(fa, size, 1);
+      for (i = 0; i < n; ++i)
+         data[i * stride] = (float) fa[i + len - 1].re;
+      ok = 1;
+   }
+
+done:
+   if (fa) STBTT_free(fa, 0);
+   if (fb) STBTT_free(fb, 0);
+   return ok;
+}
+
+// convolve a 1D signal of n samples (spaced stride floats apart) in place
+// with the 1D kernel of 2*radius+1 coefficients
+STBTT__CONV_UNUSED static int stbtt__convolve_1d(float *data, int n, int stride, const float *kernel, int radius, int edge_mode)
+{
+   int len;
+   int i;
+
+   if (data == 0)
+      return 0;
+   if (!stbtt__conv_check_args(n, kernel, radius, edge_mode))
+      return 0;
+
+   len = 2 * radius + 1;
+
+   if (radius <= STBTT__CONV_SMALL_RADIUS) {
+      // small kernel: direct per-pixel evaluation, O(n*radius)
+      float *tmp = (float *) STBTT_malloc(sizeof(float) * n, 0);
+      int k;
+      if (tmp == 0)
+         return 0;
+      for (i = 0; i < n; ++i) {
+         float sum = 0.0f;
+         for (k = -radius; k <= radius; ++k) {
+            int is_zero;
+            int idx = stbtt__conv_edge_map(i + k, n, edge_mode, &is_zero);
+            if (!is_zero)
+               sum += kernel[radius + k] * data[idx * stride];
+         }
+         tmp[i] = sum;
+      }
+      for (i = 0; i < n; ++i)
+         data[i * stride] = tmp[i];
+      STBTT_free(tmp, 0);
+      return 1;
+   }
+
+   // large kernel: pick sliding-window or FFT path
+   {
+      int uniform = 1;
+      for (i = 1; i < len; ++i) {
+         if (kernel[i] != kernel[0]) {
+            uniform = 0;
+            break;
+         }
+      }
+      if (uniform)
+         return stbtt__convolve_1d_sliding(data, n, stride, kernel[0], radius, edge_mode);
+      return stbtt__convolve_1d_fft(data, n, stride, kernel, radius, edge_mode);
+   }
+}
+
+// separable 2D convolution of a w x h float image (row stride in floats,
+// stride >= w): one horizontal pass with kernel_x, one vertical pass with
+// kernel_y; mathematically equivalent to the direct 2D convolution with the
+// outer-product kernel kernel_y[j]*kernel_x[i]
+STBTT__CONV_UNUSED static int stbtt__convolve2d_separable(float *pixels, int w, int h, int stride, const float *kernel_x, int radius_x, const float *kernel_y, int radius_y, int edge_mode)
+{
+   int x, y;
+
+   if (pixels == 0)
+      return 0;
+   if (w < 1 || h < 1 || stride < w)
+      return 0;
+   if (!stbtt__conv_check_args(w, kernel_x, radius_x, edge_mode))
+      return 0;
+   if (!stbtt__conv_check_args(h, kernel_y, radius_y, edge_mode))
+      return 0;
+
+   for (y = 0; y < h; ++y) {
+      if (!stbtt__convolve_1d(pixels + y * stride, w, 1, kernel_x, radius_x, edge_mode))
+         return 0;
+   }
+   for (x = 0; x < w; ++x) {
+      if (!stbtt__convolve_1d(pixels + x, h, stride, kernel_y, radius_y, edge_mode))
+         return 0;
+   }
+   return 1;
+}
+
 static void stbtt__h_prefilter(unsigned char *pixels, int w, int h, int stride_in_bytes, unsigned int kernel_width)
 {
    unsigned char buffer[STBTT_MAX_OVERSAMPLE];
