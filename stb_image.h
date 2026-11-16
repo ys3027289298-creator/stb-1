@@ -565,6 +565,50 @@ STBIDEF int      stbi_is_16_bit          (char const *filename);
 STBIDEF int      stbi_is_16_bit_from_file(FILE *f);
 #endif
 
+// decode statistics: build with -DSTBI_STATS to enable. when STBI_STATS is
+// not defined all calls below compile away to nothing and every decode takes
+// the exact original code path (same allocs, same outputs, no overhead).
+//
+// usage: call stbi_stats_begin() once before a decode (or a batch of decodes),
+// then stbi_stats_end() and read the filled struct. time values are in
+// nanoseconds; the four stage buckets partition the whole decode wall time.
+// in an STBI_STATS build internal allocations carry a small accounting
+// prefix (whether or not a session is active), so buffers returned by
+// stbi_load*() must be released with stbi_image_free(), not a raw free().
+// builds without STBI_STATS are untouched: no prefix, no counters.
+enum
+{
+   STBI_STATS_HEADER  = 0, // chunk/marker/container header parsing
+   STBI_STATS_INFLATE = 1, // entropy/deflate decompression (JPEG huffman+IDCT included)
+   STBI_STATS_FILTER   = 2, // row unfiltering, upsampling, per-pixel decode
+   STBI_STATS_CONVERT  = 3, // channel/depth format conversion, flips, final packaging
+   STBI_STATS_STAGES   = 4
+};
+
+typedef struct
+{
+   int          enabled;                          // 1 while a session is active
+   int          image_type;                       // STBI_type_* of the last decode, 0 before any
+   int          success;                          // 1 if the last decode succeeded, 0 on failure
+   unsigned long long stage_ns[STBI_STATS_STAGES]; // time spent in each stage, nanoseconds
+   unsigned long long total_ns;                    // wall time of the whole decode, nanoseconds
+   unsigned int alloc_count;                      // number of malloc/realloc calls
+   unsigned int free_count;                       // number of free calls
+   size_t       bytes_live;                       // currently outstanding bytes (logical sizes)
+   size_t       bytes_peak;                       // maximum bytes_live reached during the session
+   size_t       bytes_total;                      // sum of every allocation's logical size
+   unsigned int zlib_blocks[4];                   // deflate blocks: stored/fixed/dynamic/error, by type
+   unsigned int zlib_input_bytes;                 // compressed bytes fed to the inflate stage
+   unsigned int zlib_output_bytes;                // bytes produced by the inflate stage
+} stbi_stats;
+
+// start/end a statistics session around one or more decodes. begin() zeroes
+// the struct; end() returns the same pointer for convenience. these are
+// no-ops (returning NULL) in builds without STBI_STATS.
+STBIDEF int          stbi_stats_enabled(void);
+STBIDEF stbi_stats  *stbi_stats_begin(void);
+STBIDEF stbi_stats  *stbi_stats_end(void);
+
 
 
 // for image formats that explicitly notate that they have premultiplied alpha,
@@ -855,6 +899,189 @@ static int stbi__sse2_available(void)
 #define STBI_MAX_DIMENSIONS (1 << 24)
 #endif
 
+// ---------------------------------------------------------------------------
+// decode statistics (opt-in; define STBI_STATS to enable)
+//
+// every hook in this section and the loader code below is written so that a
+// build without STBI_STATS keeps the original statements verbatim: the
+// instrumentation macros expand to nothing, the allocation wrappers reduce
+// to plain STBI_MALLOC/STBI_REALLOC_SIZED/STBI_FREE, and no extra data is
+// stored anywhere. the output pixels are therefore byte-identical either
+// way, and a disabled build has zero bookkeeping overhead.
+// ---------------------------------------------------------------------------
+#ifdef STBI_STATS
+#include <time.h>
+
+// match the library's own TLS degradation: where thread-local storage is
+// unavailable, fall back to plain statics (single-threaded use only)
+#ifndef STBI_THREAD_LOCAL
+#define STBI_THREAD_LOCAL
+#endif
+
+// accounting prefix prepended to every allocation made while a session is
+// active. magic marks prefixes so stbi__free can find them on release;
+// keeping the user pointer max_aligned_t-aligned is required for callers
+// that load aligned data (SSE/NEON) directly out of stbi buffers.
+typedef union { size_t sz; void *p; double d; long long ll; } stbi__stats_align_t;
+#define STBI__STATS_MAGIC 0x53544253u // 'STBS'
+typedef struct {
+   stbi__stats_align_t  align_; // keeps stbi__malloc's return address aligned
+   unsigned int         magic;
+   size_t               user_size;
+} stbi__stats_hdr;
+
+static STBI_THREAD_LOCAL stbi_stats stbi__stats_data;
+static STBI_THREAD_LOCAL stbi_stats *stbi__stats_active;
+static STBI_THREAD_LOCAL unsigned long long stbi__stats_t0, stbi__stats_stage_t0;
+static STBI_THREAD_LOCAL int stbi__stats_stage;
+
+static unsigned long long stbi__stats_now_ns(void)
+{
+#if defined(CLOCK_MONOTONIC)
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (unsigned long long) ts.tv_sec * 1000000000ull + (unsigned long long) ts.tv_nsec;
+#else
+   return (unsigned long long) clock() * 1000000000ull / CLOCKS_PER_SEC;
+#endif
+}
+
+// stage switches accumulate elapsed time into the previous stage bucket
+#define stbi__stats_stage_begin(stage)                                            \
+   do {                                                                           \
+      if (stbi__stats_active) {                                                   \
+         unsigned long long now_ = stbi__stats_now_ns();                          \
+         stbi__stats_data.stage_ns[stbi__stats_stage] +=                          \
+            now_ - stbi__stats_stage_t0;                                          \
+         stbi__stats_stage = (stage);                                             \
+         stbi__stats_stage_t0 = now_;                                             \
+      }                                                                           \
+   } while (0)
+
+#define stbi__stats_block(type)                                                   \
+   do { if (stbi__stats_active) ++stbi__stats_data.zlib_blocks[(type)]; } while (0)
+#define stbi__stats_zlib_in(n)                                                    \
+   do { if (stbi__stats_active) stbi__stats_data.zlib_input_bytes += (n); } while (0)
+#define stbi__stats_zlib_out(n)                                                   \
+   do { if (stbi__stats_active) stbi__stats_data.zlib_output_bytes += (n); } while (0)
+#define stbi__stats_type(type)                                                    \
+   do { if (stbi__stats_active) stbi__stats_data.image_type = (type); } while (0)
+#define stbi__stats_result(ok)                                                    \
+   do { if (stbi__stats_active) stbi__stats_data.success = !!(ok); } while (0)
+
+STBIDEF int stbi_stats_enabled(void) { return stbi__stats_active != NULL; }
+
+STBIDEF stbi_stats *stbi_stats_begin(void)
+{
+   memset(&stbi__stats_data, 0, sizeof(stbi__stats_data));
+   stbi__stats_data.enabled = 1;
+   stbi__stats_stage = STBI_STATS_HEADER;
+   stbi__stats_active = &stbi__stats_data;
+   stbi__stats_t0 = stbi__stats_stage_t0 = stbi__stats_now_ns();
+   return stbi__stats_active;
+}
+
+STBIDEF stbi_stats *stbi_stats_end(void)
+{
+   stbi_stats *r;
+   if (!stbi__stats_active) return NULL;
+   // flush whatever stage was open
+   stbi__stats_stage_begin(STBI_STATS_HEADER);
+   stbi__stats_data.total_ns = stbi__stats_now_ns() - stbi__stats_t0;
+   stbi__stats_data.enabled = 0;
+   r = stbi__stats_active;
+   stbi__stats_active = NULL;
+   return r;
+}
+
+// In a stats-enabled build every internal allocation carries an accounting
+// header for its whole lifetime, including across begin()/end(), so a buffer
+// returned by a decode is always released correctly even after the session
+// ends. Only the bookkeeping counters are session-gated; a disabled session
+// therefore costs nothing beyond the header bytes and the pointer
+// adjustments. Builds without STBI_STATS take the original allocator path.
+static void *stbi__stats_malloc(size_t size)
+{
+   stbi__stats_hdr *h = (stbi__stats_hdr *) STBI_MALLOC(size + sizeof(stbi__stats_hdr));
+   if (!h) return NULL;
+   h->magic = STBI__STATS_MAGIC;
+   h->user_size = size;
+   if (stbi__stats_active) {
+      ++stbi__stats_data.alloc_count;
+      stbi__stats_data.bytes_total += size;
+      stbi__stats_data.bytes_live += size;
+      if (stbi__stats_data.bytes_live > stbi__stats_data.bytes_peak)
+         stbi__stats_data.bytes_peak = stbi__stats_data.bytes_live;
+   }
+   return (void *) (h + 1);
+}
+
+static void *stbi__stats_realloc_sized(void *p, size_t old_size, size_t new_size)
+{
+   stbi__stats_hdr *h, *nh;
+   void *np;
+   STBI_NOTUSED(old_size);
+   if (!p) return stbi__stats_malloc(new_size);
+   h = (stbi__stats_hdr *) p - 1;
+   if (h->magic != STBI__STATS_MAGIC) {
+      // foreign buffer not allocated by stbi__malloc: reallocate plainly
+      return STBI_REALLOC_SIZED(p, old_size, new_size);
+   }
+   {
+      size_t old_user = h->user_size;
+      np = STBI_REALLOC_SIZED(h, old_user + sizeof(stbi__stats_hdr),
+                                  new_size + sizeof(stbi__stats_hdr));
+      if (!np) return NULL;
+      nh = (stbi__stats_hdr *) np;
+      nh->magic = STBI__STATS_MAGIC;
+      nh->user_size = new_size;
+      if (stbi__stats_active) {
+         ++stbi__stats_data.alloc_count;
+         stbi__stats_data.bytes_total += new_size;
+         stbi__stats_data.bytes_live += new_size - old_user;
+         if (stbi__stats_data.bytes_live > stbi__stats_data.bytes_peak)
+            stbi__stats_data.bytes_peak = stbi__stats_data.bytes_live;
+      }
+   }
+   return (void *) (nh + 1);
+}
+
+static void stbi__stats_free(void *p)
+{
+   stbi__stats_hdr *h;
+   if (!p) return;
+   h = (stbi__stats_hdr *) p - 1;
+   if (h->magic != STBI__STATS_MAGIC) { STBI_FREE(p); return; } // foreign buffer
+   if (stbi__stats_active) {
+      ++stbi__stats_data.free_count;
+      stbi__stats_data.bytes_live -= h->user_size;
+   }
+   h->magic = 0;
+   STBI_FREE(h);
+}
+
+#define STBI_MALLOC_STATS(sz)            stbi__stats_malloc(sz)
+#define STBI_REALLOC_SIZED_STATS(p,o,n)  stbi__stats_realloc_sized((p),(o),(n))
+#define STBI_FREE_STATS(p)               stbi__stats_free(p)
+
+#else // !STBI_STATS: no-op hooks, original allocation path, zero overhead
+
+STBIDEF int         stbi_stats_enabled(void) { return 0; }
+STBIDEF stbi_stats *stbi_stats_begin(void)   { return NULL; }
+STBIDEF stbi_stats *stbi_stats_end(void)     { return NULL; }
+
+#define stbi__stats_stage_begin(stage)   ((void) 0)
+#define stbi__stats_block(type)          ((void) 0)
+#define stbi__stats_zlib_in(n)           ((void) 0)
+#define stbi__stats_zlib_out(n)          ((void) 0)
+#define stbi__stats_type(type)           ((void) 0)
+#define stbi__stats_result(ok)           ((void) 0)
+#define STBI_MALLOC_STATS(sz)            STBI_MALLOC(sz)
+#define STBI_REALLOC_SIZED_STATS(p,o,n)  STBI_REALLOC_SIZED((p),(o),(n))
+#define STBI_FREE_STATS(p)               STBI_FREE(p)
+
+#endif // STBI_STATS
+
 ///////////////////////////////////////////////
 //
 //  stbi__context struct and start_xxx functions
@@ -1043,7 +1270,7 @@ static int stbi__err(const char *str)
 
 static void *stbi__malloc(size_t size)
 {
-    return STBI_MALLOC(size);
+    return STBI_MALLOC_STATS(size);
 }
 
 // stb_image uses ints pervasively, including for offset calculations.
@@ -1161,7 +1388,7 @@ static int stbi__mul2shorts_valid(int a, int b)
 
 STBIDEF void stbi_image_free(void *retval_from_stbi_load)
 {
-   STBI_FREE(retval_from_stbi_load);
+   STBI_FREE_STATS(retval_from_stbi_load);
 }
 
 #ifndef STBI_NO_LINEAR
@@ -1207,16 +1434,16 @@ static void *stbi__load_main(stbi__context *s, int *x, int *y, int *comp, int re
    // test the formats with a very explicit header first (at least a FOURCC
    // or distinctive magic number first)
    #ifndef STBI_NO_PNG
-   if (stbi__png_test(s))  return stbi__png_load(s,x,y,comp,req_comp, ri);
+   if (stbi__png_test(s))  { stbi__stats_type(STBI_type_png); return stbi__png_load(s,x,y,comp,req_comp, ri); }
    #endif
    #ifndef STBI_NO_BMP
-   if (stbi__bmp_test(s))  return stbi__bmp_load(s,x,y,comp,req_comp, ri);
+   if (stbi__bmp_test(s))  { stbi__stats_type(STBI_type_bmp); return stbi__bmp_load(s,x,y,comp,req_comp, ri); }
    #endif
    #ifndef STBI_NO_GIF
-   if (stbi__gif_test(s))  return stbi__gif_load(s,x,y,comp,req_comp, ri);
+   if (stbi__gif_test(s))  { stbi__stats_type(STBI_type_gif); return stbi__gif_load(s,x,y,comp,req_comp, ri); }
    #endif
    #ifndef STBI_NO_PSD
-   if (stbi__psd_test(s))  return stbi__psd_load(s,x,y,comp,req_comp, ri, bpc);
+   if (stbi__psd_test(s))  { stbi__stats_type(STBI_type_psd); return stbi__psd_load(s,x,y,comp,req_comp, ri, bpc); }
    #else
    STBI_NOTUSED(bpc);
    #endif
@@ -1225,23 +1452,27 @@ static void *stbi__load_main(stbi__context *s, int *x, int *y, int *comp, int re
    // bytes matching expectations; these are prone to false positives, so
    // try them later
    #ifndef STBI_NO_JPEG
-   if (stbi__jpeg_test(s)) return stbi__jpeg_load(s,x,y,comp,req_comp, ri);
+   if (stbi__jpeg_test(s)) { stbi__stats_type(STBI_type_jpeg); return stbi__jpeg_load(s,x,y,comp,req_comp, ri); }
    #endif
    #ifndef STBI_NO_PNM
-   if (stbi__pnm_test(s))  return stbi__pnm_load(s,x,y,comp,req_comp, ri);
+   if (stbi__pnm_test(s))  { stbi__stats_type(STBI_type_pnm); return stbi__pnm_load(s,x,y,comp,req_comp, ri); }
    #endif
 
    #ifndef STBI_NO_HDR
    if (stbi__hdr_test(s)) {
-      float *hdr = stbi__hdr_load(s, x,y,comp,req_comp, ri);
+      float *hdr;
+      stbi__stats_type(STBI_type_hdr);
+      hdr = stbi__hdr_load(s, x,y,comp,req_comp, ri);
       return stbi__hdr_to_ldr(hdr, *x, *y, req_comp ? req_comp : *comp);
    }
    #endif
 
    #ifndef STBI_NO_TGA
    // test tga last because it's a crappy test!
-   if (stbi__tga_test(s))
+   if (stbi__tga_test(s)) {
+      stbi__stats_type(STBI_type_tga);
       return stbi__tga_load(s,x,y,comp,req_comp, ri);
+   }
    #endif
 
    return stbi__errpuc("unknown image type", "Image not of any known type, or corrupt");
@@ -1257,14 +1488,14 @@ static stbi_uc *stbi__convert_16_to_8(stbi__uint16 *orig, int w, int h, int chan
    img_len = w * h * channels;
    reduced = (stbi_uc *) stbi__malloc(img_len);
    if (reduced == NULL) {
-       STBI_FREE(orig);
+       STBI_FREE_STATS(orig);
        return stbi__errpuc("outofmem", "Out of memory");
    }
 
    for (i = 0; i < img_len; ++i)
       reduced[i] = (stbi_uc)((orig[i] >> 8) & 0xFF); // top half of each byte is sufficient approx of 16->8 bit scaling
 
-   STBI_FREE(orig);
+   STBI_FREE_STATS(orig);
    return reduced;
 }
 
@@ -1278,14 +1509,14 @@ static stbi__uint16 *stbi__convert_8_to_16(stbi_uc *orig, int w, int h, int chan
    img_len = w * h * channels;
    enlarged = (stbi__uint16 *) stbi__malloc(img_len*2);
    if (enlarged == NULL) {
-       STBI_FREE(orig);
+       STBI_FREE_STATS(orig);
        return (stbi__uint16 *) stbi__errpuc("outofmem", "Out of memory");
    }
 
    for (i = 0; i < img_len; ++i)
       enlarged[i] = (stbi__uint16)((orig[i] << 8) + orig[i]); // replicate to high and low byte, maps 0->0, 255->0xffff
 
-   STBI_FREE(orig);
+   STBI_FREE_STATS(orig);
    return enlarged;
 }
 
@@ -1318,8 +1549,10 @@ static unsigned char *stbi__load_and_postprocess_8bit(stbi__context *s, int *x, 
    stbi__result_info ri;
    void *result = stbi__load_main(s, x, y, comp, req_comp, &ri, 8);
 
-   if (result == NULL)
+   if (result == NULL) {
+      stbi__stats_result(0);
       return NULL;
+   }
 
    // it is the responsibility of the loaders to make sure we get either 8 or 16 bit.
    STBI_ASSERT(ri.bits_per_channel == 8 || ri.bits_per_channel == 16);
@@ -1336,6 +1569,7 @@ static unsigned char *stbi__load_and_postprocess_8bit(stbi__context *s, int *x, 
       stbi__vertical_flip(result, *x, *y, channels * sizeof(stbi_uc));
    }
 
+   stbi__stats_result(1);
    return (unsigned char *) result;
 }
 
@@ -1344,8 +1578,10 @@ static stbi__uint16 *stbi__load_and_postprocess_16bit(stbi__context *s, int *x, 
    stbi__result_info ri;
    void *result = stbi__load_main(s, x, y, comp, req_comp, &ri, 16);
 
-   if (result == NULL)
+   if (result == NULL) {
+      stbi__stats_result(0);
       return NULL;
+   }
 
    // it is the responsibility of the loaders to make sure we get either 8 or 16 bit.
    STBI_ASSERT(ri.bits_per_channel == 8 || ri.bits_per_channel == 16);
@@ -1363,6 +1599,7 @@ static stbi__uint16 *stbi__load_and_postprocess_16bit(stbi__context *s, int *x, 
       stbi__vertical_flip(result, *x, *y, channels * sizeof(stbi__uint16));
    }
 
+   stbi__stats_result(1);
    return (stbi__uint16 *) result;
 }
 
@@ -1824,7 +2061,7 @@ static unsigned char *stbi__convert_format(unsigned char *data, int img_n, int r
 
    good = (unsigned char *) stbi__malloc_mad3(req_comp, x, y, 0);
    if (good == NULL) {
-      STBI_FREE(data);
+      STBI_FREE_STATS(data);
       return stbi__errpuc("outofmem", "Out of memory");
    }
 
@@ -1849,12 +2086,12 @@ static unsigned char *stbi__convert_format(unsigned char *data, int img_n, int r
          STBI__CASE(4,1) { dest[0]=stbi__compute_y(src[0],src[1],src[2]);                   } break;
          STBI__CASE(4,2) { dest[0]=stbi__compute_y(src[0],src[1],src[2]); dest[1] = src[3]; } break;
          STBI__CASE(4,3) { dest[0]=src[0];dest[1]=src[1];dest[2]=src[2];                    } break;
-         default: STBI_ASSERT(0); STBI_FREE(data); STBI_FREE(good); return stbi__errpuc("unsupported", "Unsupported format conversion");
+         default: STBI_ASSERT(0); STBI_FREE_STATS(data); STBI_FREE_STATS(good); return stbi__errpuc("unsupported", "Unsupported format conversion");
       }
       #undef STBI__CASE
    }
 
-   STBI_FREE(data);
+   STBI_FREE_STATS(data);
    return good;
 }
 #endif
@@ -1881,7 +2118,7 @@ static stbi__uint16 *stbi__convert_format16(stbi__uint16 *data, int img_n, int r
 
    good = (stbi__uint16 *) stbi__malloc_mad4(req_comp, x, y, 2, 0);
    if (good == NULL) {
-      STBI_FREE(data);
+      STBI_FREE_STATS(data);
       return (stbi__uint16 *) stbi__errpuc("outofmem", "Out of memory");
    }
 
@@ -1906,12 +2143,12 @@ static stbi__uint16 *stbi__convert_format16(stbi__uint16 *data, int img_n, int r
          STBI__CASE(4,1) { dest[0]=stbi__compute_y_16(src[0],src[1],src[2]);                   } break;
          STBI__CASE(4,2) { dest[0]=stbi__compute_y_16(src[0],src[1],src[2]); dest[1] = src[3]; } break;
          STBI__CASE(4,3) { dest[0]=src[0];dest[1]=src[1];dest[2]=src[2];                       } break;
-         default: STBI_ASSERT(0); STBI_FREE(data); STBI_FREE(good); return (stbi__uint16*) stbi__errpuc("unsupported", "Unsupported format conversion");
+         default: STBI_ASSERT(0); STBI_FREE_STATS(data); STBI_FREE_STATS(good); return (stbi__uint16*) stbi__errpuc("unsupported", "Unsupported format conversion");
       }
       #undef STBI__CASE
    }
 
-   STBI_FREE(data);
+   STBI_FREE_STATS(data);
    return good;
 }
 #endif
@@ -1923,7 +2160,7 @@ static float   *stbi__ldr_to_hdr(stbi_uc *data, int x, int y, int comp)
    float *output;
    if (!data) return NULL;
    output = (float *) stbi__malloc_mad4(x, y, comp, sizeof(float), 0);
-   if (output == NULL) { STBI_FREE(data); return stbi__errpf("outofmem", "Out of memory"); }
+   if (output == NULL) { STBI_FREE_STATS(data); return stbi__errpf("outofmem", "Out of memory"); }
    // compute number of non-alpha components
    if (comp & 1) n = comp; else n = comp-1;
    for (i=0; i < x*y; ++i) {
@@ -1936,7 +2173,7 @@ static float   *stbi__ldr_to_hdr(stbi_uc *data, int x, int y, int comp)
          output[i*comp + n] = data[i*comp + n]/255.0f;
       }
    }
-   STBI_FREE(data);
+   STBI_FREE_STATS(data);
    return output;
 }
 #endif
@@ -1949,7 +2186,7 @@ static stbi_uc *stbi__hdr_to_ldr(float   *data, int x, int y, int comp)
    stbi_uc *output;
    if (!data) return NULL;
    output = (stbi_uc *) stbi__malloc_mad3(x, y, comp, 0);
-   if (output == NULL) { STBI_FREE(data); return stbi__errpuc("outofmem", "Out of memory"); }
+   if (output == NULL) { STBI_FREE_STATS(data); return stbi__errpuc("outofmem", "Out of memory"); }
    // compute number of non-alpha components
    if (comp & 1) n = comp; else n = comp-1;
    for (i=0; i < x*y; ++i) {
@@ -1966,7 +2203,7 @@ static stbi_uc *stbi__hdr_to_ldr(float   *data, int x, int y, int comp)
          output[i*comp + k] = (stbi_uc) stbi__float2int(z);
       }
    }
-   STBI_FREE(data);
+   STBI_FREE_STATS(data);
    return output;
 }
 #endif
@@ -3309,17 +3546,17 @@ static int stbi__free_jpeg_components(stbi__jpeg *z, int ncomp, int why)
    int i;
    for (i=0; i < ncomp; ++i) {
       if (z->img_comp[i].raw_data) {
-         STBI_FREE(z->img_comp[i].raw_data);
+         STBI_FREE_STATS(z->img_comp[i].raw_data);
          z->img_comp[i].raw_data = NULL;
          z->img_comp[i].data = NULL;
       }
       if (z->img_comp[i].raw_coeff) {
-         STBI_FREE(z->img_comp[i].raw_coeff);
+         STBI_FREE_STATS(z->img_comp[i].raw_coeff);
          z->img_comp[i].raw_coeff = 0;
          z->img_comp[i].coeff = 0;
       }
       if (z->img_comp[i].linebuf) {
-         STBI_FREE(z->img_comp[i].linebuf);
+         STBI_FREE_STATS(z->img_comp[i].linebuf);
          z->img_comp[i].linebuf = NULL;
       }
    }
@@ -3937,8 +4174,12 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
    // validate req_comp
    if (req_comp < 0 || req_comp > 4) return stbi__errpuc("bad req_comp", "Internal error");
 
+   stbi__stats_stage_begin(STBI_STATS_HEADER);
    // load a jpeg image from whichever source, but leave in YCbCr format
+   stbi__stats_stage_begin(STBI_STATS_INFLATE);
    if (!stbi__decode_jpeg_image(z)) { stbi__cleanup_jpeg(z); return NULL; }
+   // entropy decode + IDCT done; resampling and color conversion are FILTER
+   stbi__stats_stage_begin(STBI_STATS_FILTER);
 
    // determine actual number of components to generate
    n = req_comp ? req_comp : z->s->img_n >= 3 ? 3 : 1;
@@ -4088,6 +4329,7 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
       *out_x = z->s->img_x;
       *out_y = z->s->img_y;
       if (comp) *comp = z->s->img_n >= 3 ? 3 : 1; // report original components, not output
+      stbi__stats_stage_begin(STBI_STATS_HEADER);
       return output;
    }
 }
@@ -4102,7 +4344,7 @@ static void *stbi__jpeg_load(stbi__context *s, int *x, int *y, int *comp, int re
    j->s = s;
    stbi__setup_jpeg(j);
    result = load_jpeg_image(j, x,y,comp,req_comp);
-   STBI_FREE(j);
+   STBI_FREE_STATS(j);
    return result;
 }
 
@@ -4116,7 +4358,7 @@ static int stbi__jpeg_test(stbi__context *s)
    stbi__setup_jpeg(j);
    r = stbi__decode_jpeg_header(j, STBI__SCAN_type);
    stbi__rewind(s);
-   STBI_FREE(j);
+   STBI_FREE_STATS(j);
    return r;
 }
 
@@ -4143,7 +4385,7 @@ static int stbi__jpeg_info(stbi__context *s, stbi_info_res *res)
    if (result) {
        res->type = STBI_type_jpeg;
    }
-   STBI_FREE(j);
+   STBI_FREE_STATS(j);
    return result;
 }
 #endif
@@ -4354,7 +4596,7 @@ static int stbi__zexpand(stbi__zbuf *z, char *zout, int n)  // need to make room
       if(limit > UINT_MAX / 2) return stbi__err("outofmem", "Out of memory");
       limit *= 2;
    }
-   q = (char *) STBI_REALLOC_SIZED(z->zout_start, old_limit, limit);
+   q = (char *) STBI_REALLOC_SIZED_STATS(z->zout_start, old_limit, limit);
    STBI_NOTUSED(old_limit);
    if (q == NULL) return stbi__err("outofmem", "Out of memory");
    z->zout_start = q;
@@ -4561,10 +4803,13 @@ static int stbi__parse_zlib(stbi__zbuf *a, int parse_header)
       final = stbi__zreceive(a,1);
       type = stbi__zreceive(a,2);
       if (type == 0) {
+         stbi__stats_block(0);
          if (!stbi__parse_uncompressed_block(a)) return 0;
       } else if (type == 3) {
+         stbi__stats_block(3);
          return 0;
       } else {
+         stbi__stats_block(type); // 1 = fixed huffman, 2 = dynamic huffman
          if (type == 1) {
             // use fixed code lengths
             if (!stbi__zbuild_huffman(&a->z_length  , stbi__zdefault_length  , STBI__ZNSYMS)) return 0;
@@ -4580,12 +4825,20 @@ static int stbi__parse_zlib(stbi__zbuf *a, int parse_header)
 
 static int stbi__do_zlib(stbi__zbuf *a, char *obuf, int olen, int exp, int parse_header)
 {
+   int result;
+   stbi_uc const *zbuffer_in = a->zbuffer;
    a->zout_start = obuf;
    a->zout       = obuf;
    a->zout_end   = obuf + olen;
    a->z_expandable = exp;
 
-   return stbi__parse_zlib(a, parse_header);
+   stbi__stats_stage_begin(STBI_STATS_INFLATE);
+   result = stbi__parse_zlib(a, parse_header);
+   stbi__stats_zlib_in((unsigned int) (a->zbuffer - zbuffer_in));
+   stbi__stats_zlib_out((unsigned int) (a->zout - a->zout_start));
+   stbi__stats_stage_begin(STBI_STATS_HEADER);
+   STBI_NOTUSED(zbuffer_in);
+   return result;
 }
 
 STBIDEF char *stbi_zlib_decode_malloc_guesssize(const char *buffer, int len, int initial_size, int *outlen)
@@ -4599,7 +4852,7 @@ STBIDEF char *stbi_zlib_decode_malloc_guesssize(const char *buffer, int len, int
       if (outlen) *outlen = (int) (a.zout - a.zout_start);
       return a.zout_start;
    } else {
-      STBI_FREE(a.zout_start);
+      STBI_FREE_STATS(a.zout_start);
       return NULL;
    }
 }
@@ -4620,7 +4873,7 @@ STBIDEF char *stbi_zlib_decode_malloc_guesssize_headerflag(const char *buffer, i
       if (outlen) *outlen = (int) (a.zout - a.zout_start);
       return a.zout_start;
    } else {
-      STBI_FREE(a.zout_start);
+      STBI_FREE_STATS(a.zout_start);
       return NULL;
    }
 }
@@ -4647,7 +4900,7 @@ STBIDEF char *stbi_zlib_decode_noheader_malloc(char const *buffer, int len, int 
       if (outlen) *outlen = (int) (a.zout - a.zout_start);
       return a.zout_start;
    } else {
-      STBI_FREE(a.zout_start);
+      STBI_FREE_STATS(a.zout_start);
       return NULL;
    }
 }
@@ -4924,7 +5177,7 @@ static int stbi__create_png_image_raw(stbi__png *a, stbi_uc *raw, stbi__uint32 r
       }
    }
 
-   STBI_FREE(filter_buf);
+   STBI_FREE_STATS(filter_buf);
    if (!all_ok) return 0;
 
    return 1;
@@ -4954,7 +5207,7 @@ static int stbi__create_png_image(stbi__png *a, stbi_uc *image_data, stbi__uint3
       if (x && y) {
          stbi__uint32 img_len = ((((a->s->img_n * x * depth) + 7) >> 3) + 1) * y;
          if (!stbi__create_png_image_raw(a, image_data, image_data_len, out_n, x, y, depth, color)) {
-            STBI_FREE(final);
+            STBI_FREE_STATS(final);
             return 0;
          }
          for (j=0; j < y; ++j) {
@@ -4965,7 +5218,7 @@ static int stbi__create_png_image(stbi__png *a, stbi_uc *image_data, stbi__uint3
                       a->out + (j*x+i)*out_bytes, out_bytes);
             }
          }
-         STBI_FREE(a->out);
+         STBI_FREE_STATS(a->out);
          image_data += img_len;
          image_data_len -= img_len;
       }
@@ -5054,7 +5307,7 @@ static int stbi__expand_png_palette(stbi__png *a, stbi_uc *palette, int len, int
          p += 4;
       }
    }
-   STBI_FREE(a->out);
+   STBI_FREE_STATS(a->out);
    a->out = temp_out;
 
    STBI_NOTUSED(len);
@@ -5161,6 +5414,8 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
    z->out = NULL;
    z->is_iphone = 0;
 
+   stbi__stats_stage_begin(STBI_STATS_HEADER);
+
    if (!stbi__check_png_header(s)) return 0;
 
    if (scan == STBI__SCAN_type) return 1;
@@ -5265,7 +5520,7 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
                   idata_limit *= 2;
                }
                STBI_NOTUSED(idata_limit_old);
-               p = (stbi_uc *) STBI_REALLOC_SIZED(z->idata, idata_limit_old, idata_limit); if (p == NULL) return stbi__err("outofmem", "Out of memory");
+               p = (stbi_uc *) STBI_REALLOC_SIZED_STATS(z->idata, idata_limit_old, idata_limit); if (p == NULL) return stbi__err("outofmem", "Out of memory");
                z->idata = p;
             }
             if (!stbi__getn(s, z->idata+ioff,c.length)) return stbi__err("outofdata","Corrupt PNG");
@@ -5283,11 +5538,14 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
             raw_len = bpl * s->img_y * s->img_n /* pixels */ + s->img_y /* filter mode per row */;
             z->expanded = (stbi_uc *) stbi_zlib_decode_malloc_guesssize_headerflag((char *) z->idata, ioff, raw_len, (int *) &raw_len, !z->is_iphone);
             if (z->expanded == NULL) return 0; // zlib should set error
-            STBI_FREE(z->idata); z->idata = NULL;
+            STBI_FREE_STATS(z->idata); z->idata = NULL;
             if ((req_comp == s->img_n+1 && req_comp != 3 && !pal_img_n) || has_trans)
                s->img_out_n = s->img_n+1;
             else
                s->img_out_n = s->img_n;
+            // inflate ended inside the zlib call above; row unfiltering and
+            // per-pixel decode are the FILTER stage.
+            stbi__stats_stage_begin(STBI_STATS_FILTER);
             if (!stbi__create_png_image(z, z->expanded, raw_len, s->img_out_n, z->depth, color, interlace)) return 0;
             if (has_trans) {
                if (z->depth == 16) {
@@ -5309,7 +5567,8 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
                // non-paletted image with tRNS -> source image has (constant) alpha
                ++s->img_n;
             }
-            STBI_FREE(z->expanded); z->expanded = NULL;
+            stbi__stats_stage_begin(STBI_STATS_HEADER);
+            STBI_FREE_STATS(z->expanded); z->expanded = NULL;
             // end of PNG chunk, read and skip CRC
             stbi__get32be(s);
             return 1;
@@ -5343,10 +5602,12 @@ static void *stbi__do_png(stbi__png *p, int *x, int *y, int *n, int req_comp, st
       result = p->out;
       p->out = NULL;
       if (req_comp && req_comp != p->s->img_out_n) {
+         stbi__stats_stage_begin(STBI_STATS_CONVERT);
          if (ri->bits_per_channel == 8)
             result = stbi__convert_format((unsigned char *) result, p->s->img_out_n, req_comp, p->s->img_x, p->s->img_y);
          else
             result = stbi__convert_format16((stbi__uint16 *) result, p->s->img_out_n, req_comp, p->s->img_x, p->s->img_y);
+         stbi__stats_stage_begin(STBI_STATS_HEADER);
          p->s->img_out_n = req_comp;
          if (result == NULL) return result;
       }
@@ -5354,9 +5615,9 @@ static void *stbi__do_png(stbi__png *p, int *x, int *y, int *n, int req_comp, st
       *y = p->s->img_y;
       if (n) *n = p->s->img_n;
    }
-   STBI_FREE(p->out);      p->out      = NULL;
-   STBI_FREE(p->expanded); p->expanded = NULL;
-   STBI_FREE(p->idata);    p->idata    = NULL;
+   STBI_FREE_STATS(p->out);      p->out      = NULL;
+   STBI_FREE_STATS(p->expanded); p->expanded = NULL;
+   STBI_FREE_STATS(p->idata);    p->idata    = NULL;
 
    return result;
 }
@@ -5590,6 +5851,7 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
    stbi__bmp_data info;
    STBI_NOTUSED(ri);
 
+   stbi__stats_stage_begin(STBI_STATS_HEADER);
    info.all_a = 255;
    if (stbi__bmp_parse_header(s, &info) == NULL)
       return NULL; // error code already set
@@ -5651,9 +5913,11 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
 
    out = (stbi_uc *) stbi__malloc_mad3(target, s->img_x, s->img_y, 0);
    if (!out) return stbi__errpuc("outofmem", "Out of memory");
+   // header and palette done; the row decode below is the FILTER stage
+   stbi__stats_stage_begin(STBI_STATS_FILTER);
    if (info.bpp < 16) {
       int z=0;
-      if (psize == 0 || psize > 256) { STBI_FREE(out); return stbi__errpuc("invalid", "Corrupt BMP"); }
+      if (psize == 0 || psize > 256) { STBI_FREE_STATS(out); return stbi__errpuc("invalid", "Corrupt BMP"); }
       memset(pal, 0, sizeof(pal));
       for (i=0; i < psize; ++i) {
          pal[i][2] = stbi__get8(s);
@@ -5666,7 +5930,7 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
       if (info.bpp == 1) width = (s->img_x + 7) >> 3;
       else if (info.bpp == 4) width = (s->img_x + 1) >> 1;
       else if (info.bpp == 8) width = s->img_x;
-      else { STBI_FREE(out); return stbi__errpuc("bad bpp", "Corrupt BMP"); }
+      else { STBI_FREE_STATS(out); return stbi__errpuc("bad bpp", "Corrupt BMP"); }
       pad = (-width)&3;
       if (info.bpp == 1) {
          for (j=0; j < (int) s->img_y; ++j) {
@@ -5728,13 +5992,13 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
          }
       }
       if (!easy) {
-         if (!mr || !mg || !mb) { STBI_FREE(out); return stbi__errpuc("bad masks", "Corrupt BMP"); }
+         if (!mr || !mg || !mb) { STBI_FREE_STATS(out); return stbi__errpuc("bad masks", "Corrupt BMP"); }
          // right shift amt to put high bit in position #7
          rshift = stbi__high_bit(mr)-7; rcount = stbi__bitcount(mr);
          gshift = stbi__high_bit(mg)-7; gcount = stbi__bitcount(mg);
          bshift = stbi__high_bit(mb)-7; bcount = stbi__bitcount(mb);
          ashift = stbi__high_bit(ma)-7; acount = stbi__bitcount(ma);
-         if (rcount > 8 || gcount > 8 || bcount > 8 || acount > 8) { STBI_FREE(out); return stbi__errpuc("bad masks", "Corrupt BMP"); }
+         if (rcount > 8 || gcount > 8 || bcount > 8 || acount > 8) { STBI_FREE_STATS(out); return stbi__errpuc("bad masks", "Corrupt BMP"); }
       }
       for (j=0; j < (int) s->img_y; ++j) {
          if (easy) {
@@ -5774,8 +6038,10 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
       stbi__vertical_flip(out, s->img_x, s->img_y, target);
 
    if (req_comp && req_comp != target) {
+      stbi__stats_stage_begin(STBI_STATS_CONVERT);
       out = stbi__convert_format(out, target, req_comp, s->img_x, s->img_y);
       if (out == NULL) return out; // stbi__convert_format frees input on failure
+      stbi__stats_stage_begin(STBI_STATS_HEADER);
    }
 
    *x = s->img_x;
@@ -5888,6 +6154,7 @@ static void stbi__tga_read_rgb16(stbi__context *s, stbi_uc* out)
 
 static void *stbi__tga_load(stbi__context *s, int *x, int *y, int *comp, int req_comp, stbi__result_info *ri)
 {
+   stbi__stats_stage_begin(STBI_STATS_HEADER);
    // read in the TGA header
    int tga_offset = stbi__get8(s);
    int tga_indexed = stbi__get8(s);
@@ -5946,12 +6213,14 @@ static void *stbi__tga_load(stbi__context *s, int *x, int *y, int *comp, int req
 
    // skip to the data's starting position (offset usually = 0)
    stbi__skip(s, tga_offset);
+   // header parsed; RLE expansion and pixel unpacking are the FILTER stage
+   stbi__stats_stage_begin(STBI_STATS_FILTER);
 
    if (!tga_indexed && !tga_is_RLE && !tga_rgb16) {
       for (i=0; i < tga_height; ++i) {
          stbi_uc *tga_row = tga_data + i*tga_width*tga_comp;
          if (!stbi__getn(s, tga_row, tga_width * tga_comp)) {
-            STBI_FREE(tga_data);
+            STBI_FREE_STATS(tga_data);
             return stbi__errpuc("premature EOF", "Corrupt TGA");
          }
       }
@@ -5959,14 +6228,14 @@ static void *stbi__tga_load(stbi__context *s, int *x, int *y, int *comp, int req
       //   do I need to load a palette?
       if (tga_indexed) {
          if (tga_palette_len == 0) {  /* you have to have at least one entry! */
-            STBI_FREE(tga_data);
+            STBI_FREE_STATS(tga_data);
             return stbi__errpuc("bad palette", "Corrupt TGA");
          }
 
          stbi__skip(s, tga_palette_start);
          tga_palette = (unsigned char*)stbi__malloc_mad2(tga_palette_len, tga_comp, 0);
          if (!tga_palette) {
-            STBI_FREE(tga_data);
+            STBI_FREE_STATS(tga_data);
             return stbi__errpuc("outofmem", "Out of memory");
          }
          if (tga_rgb16) {
@@ -5977,8 +6246,8 @@ static void *stbi__tga_load(stbi__context *s, int *x, int *y, int *comp, int req
                pal_entry += tga_comp;
             }
          } else if (!stbi__getn(s, tga_palette, tga_palette_len * tga_comp)) {
-            STBI_FREE(tga_data);
-            STBI_FREE(tga_palette);
+            STBI_FREE_STATS(tga_data);
+            STBI_FREE_STATS(tga_palette);
             return stbi__errpuc("bad palette", "Corrupt TGA");
          }
       }
@@ -6034,7 +6303,7 @@ static void *stbi__tga_load(stbi__context *s, int *x, int *y, int *comp, int req
       }
       //   clear my palette, if I had one
       if (tga_palette != NULL) {
-         STBI_FREE(tga_palette);
+         STBI_FREE_STATS(tga_palette);
       }
    }
 
@@ -6071,8 +6340,11 @@ static void *stbi__tga_load(stbi__context *s, int *x, int *y, int *comp, int req
    }
 
    // convert to target component count
-   if (req_comp && req_comp != tga_comp)
+   if (req_comp && req_comp != tga_comp) {
+      stbi__stats_stage_begin(STBI_STATS_CONVERT);
       tga_data = stbi__convert_format(tga_data, tga_comp, req_comp, tga_width, tga_height);
+      stbi__stats_stage_begin(STBI_STATS_HEADER);
+   }
 
    // these were just read for the side effect
    STBI_NOTUSED(tga_palette_bits);
@@ -6245,7 +6517,7 @@ static void *stbi__psd_load(stbi__context *s, int *x, int *y, int *comp, int req
          } else {
             // Read the RLE data.
             if (!stbi__psd_decode_rle(s, p, pixelCount)) {
-               STBI_FREE(out);
+               STBI_FREE_STATS(out);
                return stbi__errpuc("corrupt", "bad RLE data");
             }
          }
@@ -6425,13 +6697,13 @@ static int stbi__gif_info_raw(stbi__context *s, int *x, int *y, int *comp)
    stbi__gif* g = (stbi__gif*) stbi__malloc(sizeof(stbi__gif));
    if (!g) return stbi__err("outofmem", "Out of memory");
    if (!stbi__gif_header(s, g, comp, 1)) {
-      STBI_FREE(g);
+      STBI_FREE_STATS(g);
       stbi__rewind( s );
       return 0;
    }
    if (x) *x = g->w;
    if (y) *y = g->h;
-   STBI_FREE(g);
+   STBI_FREE_STATS(g);
    return 1;
 }
 
@@ -6773,7 +7045,7 @@ static void *stbi__load_gif_main(stbi__context *s, int **delays, int *x, int *y,
    }
 
    // free temp decode buffer
-   STBI_FREE(g->out);
+   STBI_FREE_STATS(g->out);
 
    // allocate output space
    if (ok) {
@@ -6800,7 +7072,7 @@ static void *stbi__load_gif_main(stbi__context *s, int **delays, int *x, int *y,
       }
 
       frame = frames->prev;
-      STBI_FREE(frames); // free current frame
+      STBI_FREE_STATS(frames); // free current frame
       frames = frame;
    }
 
@@ -6810,11 +7082,11 @@ static void *stbi__load_gif_main(stbi__context *s, int **delays, int *x, int *y,
 
    // if conversion failed, also free delays
    if (!out && delays && *delays) {
-      STBI_FREE(*delays);
+      STBI_FREE_STATS(*delays);
       *delays = NULL;
    }
 
-   STBI_FREE(g);
+   STBI_FREE_STATS(g);
    *z = layers;
    return out;
 }
@@ -6842,9 +7114,9 @@ static void *stbi__gif_load(stbi__context *s, int *x, int *y, int *comp, int req
          u = stbi__convert_format(u, 4, req_comp, g->w, g->h);
    } else if (g->out) {
       // if there was an error and we allocated an image buffer, free it!
-      STBI_FREE(g->out);
+      STBI_FREE_STATS(g->out);
    }
-   STBI_FREE(g);
+   STBI_FREE_STATS(g);
 
    return u;
 }
@@ -7059,19 +7331,19 @@ static float *stbi__hdr_load(stbi__context *s, int *x, int *y, int *comp, int re
    if (isrle) {
       scanline = (stbi_uc *) stbi__malloc_mad2(width, 4, 0);
       if (!scanline) {
-         STBI_FREE(hdr_data);
+         STBI_FREE_STATS(hdr_data);
          return stbi__errpf("outofmem", "Out of memory");
       }
    }
 
    if (!stbi__hdr_load_pixels(s, hdr_data, width, height, req_comp, isrle, scanline))
    {
-      STBI_FREE(hdr_data);
+      STBI_FREE_STATS(hdr_data);
       hdr_data = NULL;
    }
 
    if (scanline)
-      STBI_FREE(scanline);
+      STBI_FREE_STATS(scanline);
 
    return hdr_data;
 }
@@ -7311,7 +7583,7 @@ static void *stbi__pnm_load(stbi__context *s, int *x, int *y, int *comp, int req
    nvals = s->img_n * s->img_x * s->img_y;
    if (!isascii) {
       if (!stbi__getn(s, out, nvals * bpv)) {
-         STBI_FREE(out);
+         STBI_FREE_STATS(out);
          return stbi__errpuc("bad PNM", "PNM file truncated");
       }
    } else {
@@ -7321,7 +7593,7 @@ static void *stbi__pnm_load(stbi__context *s, int *x, int *y, int *comp, int req
          stbi__pnm_skip_whitespace(s, &c);
          val = stbi__pnm_getinteger(s, &c);
          if (val < 0) {
-            STBI_FREE(out);
+            STBI_FREE_STATS(out);
             return NULL; // error already set
          }
          if (val > maxv) val = maxv - 1;
