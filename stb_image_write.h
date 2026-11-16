@@ -45,6 +45,7 @@ USAGE:
    There are five functions, one for each image file format:
 
      int stbi_write_png(char const *filename, int w, int h, int comp, const void *data, ptrdiff_t stride_in_bytes);
+     int stbi_write_png16(char const *filename, int w, int h, int comp, const unsigned short *data, ptrdiff_t stride_in_bytes);
      int stbi_write_bmp(char const *filename, int w, int h, int comp, const void *data);
      int stbi_write_tga(char const *filename, int w, int h, int comp, const void *data);
      int stbi_write_jpg(char const *filename, int w, int h, int comp, const void *data, int quality);
@@ -196,6 +197,7 @@ STBIWDEF int stbi_write_force_png_filter;
 
 #ifndef STBI_WRITE_NO_STDIO
 STBIWDEF int stbi_write_png(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+STBIWDEF int stbi_write_png16(char const *filename, int w, int h, int comp, const unsigned short *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_bmp(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_tga(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
@@ -214,6 +216,7 @@ STBIWDEF int stbiw_convert_wchar_to_utf8(char *buffer, size_t bufferlen, const w
 typedef void stbi_write_func(void *context, void *data, int size);
 
 STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+STBIWDEF int stbi_write_png16_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const unsigned short *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_bmp_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_tga_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data);
@@ -1396,6 +1399,129 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    return out;
 }
 
+// 16-bit-per-channel variant of stbi_write_png_to_mem: takes unsigned short
+// samples, stores them big-endian (network byte order) as required by PNG,
+// and tags the IHDR with bit depth 16. comp 1..4 maps to color types
+// greyscale, greyscale+alpha, RGB, RGBA; alpha is a plain unsigned 16-bit
+// channel like any other.
+STBIWDEF unsigned char *stbi_write_png16_to_mem(const unsigned short *pixels, ptrdiff_t stride_bytes, int x, int y, int n, int *out_len)
+{
+   int force_filter = stbi_write_force_png_filter;
+   int ctype[5] = { -1, 0, 4, 2, 6 };
+   unsigned char sig[8] = { 137,80,78,71,13,10,26,10 };
+   unsigned char *out,*o, *filt, *zlib, *be;
+   signed char *line_buffer;
+   int j,zlen;
+   int row_bytes;
+
+   if (pixels == NULL)
+      return 0;
+
+   if (!stbiw__validate_dimensions(x, y, n))
+      return 0;
+
+   // row size in bytes once each 16-bit sample is stored big-endian
+   if (!stbiw__mad2sizes_valid(x*n, 2, 1)) return 0;
+   row_bytes = x*n*2;
+
+   if (stride_bytes == 0)
+      stride_bytes = row_bytes;
+   // a stride too small to hold one row means the buffer can't contain
+   // w*h*n samples, i.e. dimensions and data length don't match
+   if (stride_bytes < row_bytes)
+      return 0;
+
+   if (force_filter >= 5) {
+      force_filter = -1;
+   }
+
+   if (!stbiw__mul2sizes_valid(row_bytes+1, y)) return 0;
+   if (!stbiw__mul2sizes_valid(row_bytes, y)) return 0;
+
+   // convert to packed big-endian bytes; PNG filtering then operates on
+   // the byte stream with n*2 bytes per pixel
+   be = (unsigned char *) STBIW_MALLOC(row_bytes * y); if (!be) return 0;
+   for (j=0; j < y; ++j) {
+      const unsigned short *src = (const unsigned short *) ((const unsigned char *) pixels + j*stride_bytes);
+      unsigned char *dst = be + j*row_bytes;
+      int i, samples = x*n;
+      for (i=0; i < samples; ++i) {
+         dst[2*i+0] = STBIW_UCHAR(src[i] >> 8);
+         dst[2*i+1] = STBIW_UCHAR(src[i]);
+      }
+   }
+
+   filt = (unsigned char *) STBIW_MALLOC((row_bytes+1) * y); if (!filt) { STBIW_FREE(be); return 0; }
+   line_buffer = (signed char *) STBIW_MALLOC(row_bytes); if (!line_buffer) { STBIW_FREE(be); STBIW_FREE(filt); return 0; }
+   for (j=0; j < y; ++j) {
+      int filter_type;
+      if (force_filter > -1) {
+         filter_type = force_filter;
+         stbiw__encode_png_line(be, row_bytes, x, y, j, n*2, force_filter, line_buffer);
+      } else { // Estimate the best filter by running through all of them:
+         int best_filter = 0, best_filter_val = 0x7fffffff, est, i;
+         for (filter_type = 0; filter_type < 5; filter_type++) {
+            stbiw__encode_png_line(be, row_bytes, x, y, j, n*2, filter_type, line_buffer);
+
+            // Estimate the entropy of the line using this filter; the less, the better.
+            est = 0;
+            for (i = 0; i < row_bytes; ++i) {
+               est += abs((signed char) line_buffer[i]);
+            }
+            if (est < best_filter_val) {
+               best_filter_val = est;
+               best_filter = filter_type;
+            }
+         }
+         if (filter_type != best_filter) {  // If the last iteration already got us the best filter, don't redo it
+            stbiw__encode_png_line(be, row_bytes, x, y, j, n*2, best_filter, line_buffer);
+            filter_type = best_filter;
+         }
+      }
+      // when we get here, filter_type contains the filter type, and line_buffer contains the data
+      filt[j*(row_bytes+1)] = (unsigned char) filter_type;
+      STBIW_MEMMOVE(filt+j*(row_bytes+1)+1, line_buffer, row_bytes);
+   }
+   STBIW_FREE(line_buffer);
+   STBIW_FREE(be);
+   zlib = stbi_zlib_compress(filt, y*(row_bytes+1), &zlen, stbi_write_png_compression_level);
+   STBIW_FREE(filt);
+   if (!zlib) return 0;
+
+   // each tag requires 12 bytes of overhead
+   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + 12+zlen + 12);
+   if (!out) return 0;
+   *out_len = 8 + 12+13 + 12+zlen + 12;
+
+   o=out;
+   STBIW_MEMMOVE(o,sig,8); o+= 8;
+   stbiw__wp32(o, 13); // header length
+   stbiw__wptag(o, "IHDR");
+   stbiw__wp32(o, x);
+   stbiw__wp32(o, y);
+   *o++ = 16; // 16 bits per channel
+   *o++ = STBIW_UCHAR(ctype[n]);
+   *o++ = 0;
+   *o++ = 0;
+   *o++ = 0;
+   stbiw__wpcrc(&o,13);
+
+   stbiw__wp32(o, zlen);
+   stbiw__wptag(o, "IDAT");
+   STBIW_MEMMOVE(o, zlib, zlen);
+   o += zlen;
+   STBIW_FREE(zlib);
+   stbiw__wpcrc(&o, zlen);
+
+   stbiw__wp32(o,0);
+   stbiw__wptag(o, "IEND");
+   stbiw__wpcrc(&o,0);
+
+   STBIW_ASSERT(o == out + *out_len);
+
+   return out;
+}
+
 #ifndef STBI_WRITE_NO_STDIO
 STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes)
 {
@@ -1411,12 +1537,39 @@ STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const 
    STBIW_FREE(png);
    return 1;
 }
+
+STBIWDEF int stbi_write_png16(char const *filename, int x, int y, int comp, const unsigned short *data, ptrdiff_t stride_bytes)
+{
+   FILE *f;
+   int len;
+   // the whole PNG is built in memory first, so a failure never
+   // leaves a partially written file behind
+   unsigned char *png = stbi_write_png16_to_mem(data, stride_bytes, x, y, comp, &len);
+   if (png == NULL) return 0;
+
+   f = stbiw__fopen(filename, "wb");
+   if (!f) { STBIW_FREE(png); return 0; }
+   fwrite(png, 1, len, f);
+   fclose(f);
+   STBIW_FREE(png);
+   return 1;
+}
 #endif
 
 STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes)
 {
    int len;
    unsigned char *png = stbi_write_png_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len);
+   if (png == NULL) return 0;
+   func(context, png, len);
+   STBIW_FREE(png);
+   return 1;
+}
+
+STBIWDEF int stbi_write_png16_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const unsigned short *data, ptrdiff_t stride_bytes)
+{
+   int len;
+   unsigned char *png = stbi_write_png16_to_mem(data, stride_bytes, x, y, comp, &len);
    if (png == NULL) return 0;
    func(context, png, len);
    STBIW_FREE(png);
