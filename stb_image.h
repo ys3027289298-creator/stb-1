@@ -490,6 +490,23 @@ STBIDEF stbi_us *stbi_load_16          (char const *filename, int *x, int *y, in
 STBIDEF stbi_us *stbi_load_from_file_16(FILE *f, int *x, int *y, int *channels_in_file, int desired_channels);
 #endif
 
+// 16-bits-per-channel geometry operations. These work directly on
+// unsigned-short pixel buffers returned by the 16-bit loaders; pixels are
+// never routed through an 8-bit intermediate. Both functions return a newly
+// STBI_MALLOC'd buffer (free with stbi_image_free), or NULL on bad arguments
+// or out-of-memory (see stbi_failure_reason).
+#define STBIR_16_NEAREST 0
+#define STBIR_16_BILINEAR 1
+
+// Resize a w*h image with 'channels' components per pixel (1..4) to
+// new_w*new_h. filter is one of STBIR_16_NEAREST or STBIR_16_BILINEAR.
+STBIDEF stbi_us *stbi_resize_16(stbi_us const *pixels, int w, int h, int channels,
+                                int new_w, int new_h, int filter);
+
+// Extract the pixel rectangle [x0,x0+cw) x [y0,y0+ch) from a 16-bit image.
+STBIDEF stbi_us *stbi_crop_16  (stbi_us const *pixels, int w, int h, int channels,
+                                int x0, int y0, int cw, int ch);
+
 ////////////////////////////////////
 //
 // float-per-channel interface
@@ -1287,6 +1304,141 @@ static stbi__uint16 *stbi__convert_8_to_16(stbi_uc *orig, int w, int h, int chan
 
    STBI_FREE(orig);
    return enlarged;
+}
+
+// -------------------------------------------------------------------
+// 16-bit-per-channel resize/crop (no 8-bit intermediate at any point)
+// -------------------------------------------------------------------
+
+static stbi__uint16 *stbi__crop_16_core(stbi__uint16 const *pixels,
+                                        int w, int channels,
+                                        int x0, int y0, int cw, int ch)
+{
+   int row, c;
+   stbi__uint16 *out, *dst;
+   stbi__uint16 const *src;
+
+   if (!stbi__mad4sizes_valid(cw, ch, channels, (int) sizeof(stbi__uint16), 0))
+      return (stbi__uint16 *) stbi__errpuc("too large", "Image too large to crop");
+
+   out = (stbi__uint16 *) stbi__malloc_mad3(cw * ch, channels, (int) sizeof(stbi__uint16), 0);
+   if (!out) return (stbi__uint16 *) stbi__errpuc("outofmem", "Out of memory");
+
+   for (row = 0; row < ch; ++row) {
+      src = pixels + ((size_t)(y0 + row) * w + x0) * channels;
+      dst = out + (size_t)row * cw * channels;
+      for (c = cw * channels; c > 0; --c)
+         *dst++ = *src++;
+   }
+   return out;
+}
+
+static stbi__uint16 *stbi__resize_16_nearest(stbi__uint16 const *pixels,
+                                             int w, int h, int channels,
+                                             int new_w, int new_h)
+{
+   int dy, dx, c;
+   stbi__uint16 *out, *dst;
+   stbi__uint16 const *src;
+
+   if (!stbi__mad4sizes_valid(new_w, new_h, channels, (int) sizeof(stbi__uint16), 0))
+      return (stbi__uint16 *) stbi__errpuc("too large", "Image too large to resize");
+
+   out = (stbi__uint16 *) stbi__malloc_mad3(new_w * new_h, channels, (int) sizeof(stbi__uint16), 0);
+   if (!out) return (stbi__uint16 *) stbi__errpuc("outofmem", "Out of memory");
+
+   // half-open pixel-center mapping: source center (ix+0.5)/w maps to
+   // (dx+0.5)/new_w, so ix = floor((dx+0.5)*w/new_w)
+   for (dy = 0; dy < new_h; ++dy) {
+      int sy = (int) (((dy + 0.5) * h) / new_h);
+      if (sy >= h) sy = h - 1;
+      dst = out + (size_t)dy * new_w * channels;
+      for (dx = 0; dx < new_w; ++dx) {
+         int sx = (int) (((dx + 0.5) * w) / new_w);
+         if (sx >= w) sx = w - 1;
+         src = pixels + ((size_t)sy * w + sx) * channels;
+         for (c = 0; c < channels; ++c)
+            *dst++ = src[c];
+      }
+   }
+   return out;
+}
+
+static stbi__uint16 *stbi__resize_16_bilinear(stbi__uint16 const *pixels,
+                                              int w, int h, int channels,
+                                              int new_w, int new_h)
+{
+   // sub-pixel positions in 16.16 fixed point
+   enum { STBI__R16_FRAC_BITS = 16 };
+   int dy, dx, c;
+   stbi__uint16 *out, *dst;
+
+   if (!stbi__mad4sizes_valid(new_w, new_h, channels, (int) sizeof(stbi__uint16), 0))
+      return (stbi__uint16 *) stbi__errpuc("too large", "Image too large to resize");
+
+   out = (stbi__uint16 *) stbi__malloc_mad3(new_w * new_h, channels, (int) sizeof(stbi__uint16), 0);
+   if (!out) return (stbi__uint16 *) stbi__errpuc("outofmem", "Out of memory");
+
+   for (dy = 0; dy < new_h; ++dy) {
+      // source position of this output pixel's center, in 16.16
+      stbi__uint32 fy = (stbi__uint32)(((unsigned long long)(2*dy + 1) * h << (STBI__R16_FRAC_BITS - 1)) / (unsigned)new_h);
+      int y0 = (int)(fy >> STBI__R16_FRAC_BITS);
+      unsigned wy = fy & ((1u << STBI__R16_FRAC_BITS) - 1);
+      int y1 = y0 + 1;
+      unsigned wy0 = (1u << STBI__R16_FRAC_BITS) - wy;
+      if (y0 >= h - 1) { y0 = y1 = h - 1; wy0 = (1u << STBI__R16_FRAC_BITS); wy = 0; }
+
+      dst = out + (size_t)dy * new_w * channels;
+      for (dx = 0; dx < new_w; ++dx) {
+         stbi__uint32 fx = (stbi__uint32)(((unsigned long long)(2*dx + 1) * w << (STBI__R16_FRAC_BITS - 1)) / (unsigned)new_w);
+         int x0 = (int)(fx >> STBI__R16_FRAC_BITS);
+         unsigned wx = fx & ((1u << STBI__R16_FRAC_BITS) - 1);
+         int x1 = x0 + 1;
+         unsigned wx0 = (1u << STBI__R16_FRAC_BITS) - wx;
+         stbi__uint16 const *p00, *p01, *p10, *p11;
+         if (x0 >= w - 1) { x0 = x1 = w - 1; wx0 = (1u << STBI__R16_FRAC_BITS); wx = 0; }
+
+         p00 = pixels + ((size_t)y0 * w + x0) * channels;
+         p10 = pixels + ((size_t)y0 * w + x1) * channels;
+         p01 = pixels + ((size_t)y1 * w + x0) * channels;
+         p11 = pixels + ((size_t)y1 * w + x1) * channels;
+         for (c = 0; c < channels; ++c) {
+            // separable bilinear blend, all intermediates fit in 64 bits:
+            // (0..65535 * 65535 * 65535) < 2^48
+            unsigned long long top = (unsigned long long)p00[c] * wx0 + (unsigned long long)p10[c] * wx;
+            unsigned long long bot = (unsigned long long)p01[c] * wx0 + (unsigned long long)p11[c] * wx;
+            unsigned long long blend = (top * wy0 + bot * wy) >> (STBI__R16_FRAC_BITS * 2);
+            *dst++ = (stbi__uint16) blend;
+         }
+      }
+   }
+   return out;
+}
+
+STBIDEF stbi_us *stbi_resize_16(stbi_us const *pixels, int w, int h, int channels,
+                                int new_w, int new_h, int filter)
+{
+   if (!pixels)              return (stbi_us *) stbi__errpuc("bad input", "Pixels pointer is NULL");
+   if (w <= 0 || h <= 0 || channels < 1 || channels > 4)
+                              return (stbi_us *) stbi__errpuc("bad input", "Invalid source image dimensions");
+   if (new_w <= 0 || new_h <= 0)
+                              return (stbi_us *) stbi__errpuc("bad input", "Invalid destination dimensions");
+   if (filter == STBIR_16_NEAREST)
+      return (stbi_us *) stbi__resize_16_nearest((stbi__uint16 const *) pixels, w, h, channels, new_w, new_h);
+   if (filter == STBIR_16_BILINEAR)
+      return (stbi_us *) stbi__resize_16_bilinear((stbi__uint16 const *) pixels, w, h, channels, new_w, new_h);
+   return (stbi_us *) stbi__errpuc("bad filter", "Unsupported resize filter");
+}
+
+STBIDEF stbi_us *stbi_crop_16(stbi_us const *pixels, int w, int h, int channels,
+                              int x0, int y0, int cw, int ch)
+{
+   if (!pixels)              return (stbi_us *) stbi__errpuc("bad input", "Pixels pointer is NULL");
+   if (w <= 0 || h <= 0 || channels < 1 || channels > 4)
+                              return (stbi_us *) stbi__errpuc("bad input", "Invalid source image dimensions");
+   if (cw <= 0 || ch <= 0 || x0 < 0 || y0 < 0 || x0 + cw > w || y0 + ch > h)
+                              return (stbi_us *) stbi__errpuc("bad rect", "Crop rectangle outside image");
+   return (stbi_us *) stbi__crop_16_core((stbi__uint16 const *) pixels, w, channels, x0, y0, cw, ch);
 }
 
 static void stbi__vertical_flip(void *image, int w, int h, int bytes_per_pixel)
