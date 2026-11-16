@@ -47,6 +47,7 @@
       GIF (*comp always reports as 4-channel)
       HDR (radiance rgbE format)
       PNM (PPM and PGM binary only)
+      TIFF (first page only, 8/16-bit, uncompressed/PackBits/LZW)
 
       Animated GIF still needs a proper API, but here's one way to do it:
           http://gist.github.com/urraka/685d9a6340b26b830d49
@@ -64,6 +65,7 @@ LICENSE
 
 RECENT REVISION HISTORY:
 
+      2.33  (2026-11-17) TIFF loader: first page, 8/16-bit, uncompressed/PackBits/LZW
       2.32  (2026-11-12) fix req_comp regression; other fixes
       2.31  (2026-11-08) many bugfixes and etc.
       2.30  (2024-05-31) avoid erroneous gcc warning
@@ -364,6 +366,7 @@ RECENT REVISION HISTORY:
 //        STBI_NO_GIF
 //        STBI_NO_HDR
 //        STBI_NO_PNM   (.ppm and .pgm)
+//        STBI_NO_TIF   (.tif and .tiff)
 //
 //  - You can request *only* certain decoders and suppress all other ones
 //    (this will be more forward-compatible, as addition of new decoders
@@ -377,6 +380,7 @@ RECENT REVISION HISTORY:
 //        STBI_ONLY_GIF
 //        STBI_ONLY_HDR
 //        STBI_ONLY_PNM   (.ppm and .pgm)
+//        STBI_ONLY_TIF   (.tif and .tiff)
 //
 //  - Setting STBI_NO_LINEAR will remove the stbi_loadf family of functions
 //    that returns pixel data as floats.
@@ -421,6 +425,7 @@ enum
    STBI_type_pnm,
    STBI_type_hdr,
    STBI_type_tga,
+   STBI_type_tif,
 };
 
 #include <stdlib.h>
@@ -610,7 +615,8 @@ STBIDEF int   stbi_zlib_decode_noheader_buffer(char *obuffer, int olen, const ch
 
 #if defined(STBI_ONLY_JPEG) || defined(STBI_ONLY_PNG) || defined(STBI_ONLY_BMP) \
   || defined(STBI_ONLY_TGA) || defined(STBI_ONLY_GIF) || defined(STBI_ONLY_PSD) \
-  || defined(STBI_ONLY_HDR) || defined(STBI_ONLY_PNM) || defined(STBI_ONLY_ZLIB)
+  || defined(STBI_ONLY_HDR) || defined(STBI_ONLY_PNM) || defined(STBI_ONLY_TIF) \
+  || defined(STBI_ONLY_ZLIB)
    #ifndef STBI_ONLY_JPEG
    #define STBI_NO_JPEG
    #endif
@@ -634,6 +640,9 @@ STBIDEF int   stbi_zlib_decode_noheader_buffer(char *obuffer, int olen, const ch
    #endif
    #ifndef STBI_ONLY_PNM
    #define STBI_NO_PNM
+   #endif
+   #ifndef STBI_ONLY_TIF
+   #define STBI_NO_TIF
    #endif
 #endif
 
@@ -1022,6 +1031,12 @@ static void    *stbi__pnm_load(stbi__context *s, int *x, int *y, int *comp, int 
 static int      stbi__pnm_info(stbi__context *s, stbi_info_res *res);
 #endif
 
+#ifndef STBI_NO_TIF
+static int      stbi__tif_test(stbi__context *s);
+static void    *stbi__tif_load(stbi__context *s, int *x, int *y, int *comp, int req_comp, stbi__result_info *ri);
+static int      stbi__tif_info(stbi__context *s, stbi_info_res *res);
+#endif
+
 static
 #ifdef STBI_THREAD_LOCAL
 STBI_THREAD_LOCAL
@@ -1219,6 +1234,9 @@ static void *stbi__load_main(stbi__context *s, int *x, int *y, int *comp, int re
    if (stbi__psd_test(s))  return stbi__psd_load(s,x,y,comp,req_comp, ri, bpc);
    #else
    STBI_NOTUSED(bpc);
+   #endif
+   #ifndef STBI_NO_TIF
+   if (stbi__tif_test(s))  return stbi__tif_load(s,x,y,comp,req_comp, ri);
    #endif
 
    // then the formats that can end up attempting to load with just 1 or 2
@@ -1683,7 +1701,7 @@ stbi_inline static stbi_uc stbi__get8(stbi__context *s)
    return 0;
 }
 
-#if defined(STBI_NO_JPEG) && defined(STBI_NO_HDR) && defined(STBI_NO_PNM)
+#if defined(STBI_NO_JPEG) && defined(STBI_NO_HDR) && defined(STBI_NO_PNM) && defined(STBI_NO_TIF)
 // nothing
 #else
 stbi_inline static int stbi__at_eof(stbi__context *s)
@@ -1791,7 +1809,7 @@ static stbi__uint32 stbi__get32le(stbi__context *s)
 
 #define STBI__BYTECAST(x)  ((stbi_uc) ((x) & 255))  // truncate int to byte without warnings
 
-#if defined(STBI_NO_JPEG) && defined(STBI_NO_PNG) && defined(STBI_NO_BMP) && defined(STBI_NO_PSD) && defined(STBI_NO_TGA) && defined(STBI_NO_GIF) && defined(STBI_NO_PNM)
+#if defined(STBI_NO_JPEG) && defined(STBI_NO_PNG) && defined(STBI_NO_BMP) && defined(STBI_NO_PSD) && defined(STBI_NO_TGA) && defined(STBI_NO_GIF) && defined(STBI_NO_PNM) && defined(STBI_NO_TIF)
 // nothing
 #else
 //////////////////////////////////////////////////////////////////////////////
@@ -1811,7 +1829,7 @@ static stbi_uc stbi__compute_y(int r, int g, int b)
 }
 #endif
 
-#if defined(STBI_NO_PNG) && defined(STBI_NO_BMP) && defined(STBI_NO_PSD) && defined(STBI_NO_TGA) && defined(STBI_NO_GIF) && defined(STBI_NO_PNM)
+#if defined(STBI_NO_PNG) && defined(STBI_NO_BMP) && defined(STBI_NO_PSD) && defined(STBI_NO_TGA) && defined(STBI_NO_GIF) && defined(STBI_NO_PNM) && defined(STBI_NO_TIF)
 // nothing
 #else
 static unsigned char *stbi__convert_format(unsigned char *data, int img_n, int req_comp, unsigned int x, unsigned int y)
@@ -1859,7 +1877,7 @@ static unsigned char *stbi__convert_format(unsigned char *data, int img_n, int r
 }
 #endif
 
-#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD) && defined(STBI_NO_PNM)
+#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD) && defined(STBI_NO_PNM) && defined(STBI_NO_TIF)
 // nothing
 #else
 static stbi__uint16 stbi__compute_y_16(int r, int g, int b)
@@ -1868,7 +1886,7 @@ static stbi__uint16 stbi__compute_y_16(int r, int g, int b)
 }
 #endif
 
-#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD) && defined(STBI_NO_PNM)
+#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD) && defined(STBI_NO_PNM) && defined(STBI_NO_TIF)
 // nothing
 #else
 static stbi__uint16 *stbi__convert_format16(stbi__uint16 *data, int img_n, int req_comp, unsigned int x, unsigned int y)
@@ -7378,6 +7396,586 @@ static int stbi__pnm_info(stbi__context *s, stbi_info_res *res)
 }
 #endif
 
+// *************************************************************************************************
+// TIFF loader
+//
+// Baseline TIFF subset:
+//   - first image (IFD) of a multi-page file only
+//   - 8-bit and 16-bit samples, 1-4 samples/pixel, chunky (planar configuration 1) only
+//   - compression: none (1), LZW (5), PackBits (32773)
+//   - photometric: WhiteIsZero (0), BlackIsZero (1), RGB (2)
+//   - horizontal-differencing predictor (tag 317 = 2) supported
+//
+// TIFF tag values and strip offsets are absolute file positions that can point
+// anywhere in the file, which doesn't fit stb_image's forward-only stream model,
+// so the whole input is buffered up front (for memory input the user's buffer is
+// used directly, no copy) and every access is bounds-checked against the file size.
+
+#ifndef STBI_NO_TIF
+
+typedef struct
+{
+   const stbi_uc *data;
+   size_t         len;
+   int            le; // nonzero: little-endian ("II"), zero: big-endian ("MM")
+} stbi__tif;
+
+static int stbi__tif_test(stbi__context *s)
+{
+   int b0 = stbi__get8(s), b1 = stbi__get8(s), b2 = stbi__get8(s), b3 = stbi__get8(s);
+   if (b0 == 'I' && b1 == 'I' && b2 == 42 && b3 == 0) return 1;
+   if (b0 == 'M' && b1 == 'M' && b2 == 0 && b3 == 42) return 1;
+   stbi__rewind(s);
+   return 0;
+}
+
+// endianness-aware readers; every access is bounds-checked, failure sets *ok to 0
+static stbi__uint16 stbi__tif_get16(stbi__tif *t, size_t off, int *ok)
+{
+   if (off > t->len || t->len - off < 2) { *ok = 0; return 0; }
+   if (t->le) return (stbi__uint16) (t->data[off] | (t->data[off+1] << 8));
+   else       return (stbi__uint16) ((t->data[off] << 8) | t->data[off+1]);
+}
+
+static stbi__uint32 stbi__tif_get32(stbi__tif *t, size_t off, int *ok)
+{
+   stbi__uint32 hi, lo;
+   if (off > t->len || t->len - off < 4) { *ok = 0; return 0; }
+   if (t->le) { lo = stbi__tif_get16(t, off, ok); hi = stbi__tif_get16(t, off+2, ok); }
+   else       { hi = stbi__tif_get16(t, off, ok); lo = stbi__tif_get16(t, off+2, ok); }
+   return (hi << 16) | lo;
+}
+
+// fetch value `idx` of the IFD entry at `eoff` as a 32-bit integer;
+// handles BYTE/SHORT/LONG, inline or offset storage
+static stbi__uint32 stbi__tif_tagval(stbi__tif *t, size_t eoff, stbi__uint32 idx, int *ok)
+{
+   stbi__uint16 type = stbi__tif_get16(t, eoff+2, ok);
+   stbi__uint32 count = stbi__tif_get32(t, eoff+4, ok);
+   size_t voff;
+   if (!*ok) return 0;
+   if (idx >= count) { *ok = 0; return 0; }
+   if (type == 1 || type == 3) { // BYTE / SHORT
+      stbi__uint32 sz = (type == 1) ? 1 : 2;
+      if (count <= 4/sz)
+         voff = eoff + 8 + (size_t) idx * sz;
+      else {
+         voff = stbi__tif_get32(t, eoff+8, ok);
+         if (!*ok) return 0;
+         voff += (size_t) idx * sz;
+      }
+      if (type == 1) {
+         if (voff >= t->len) { *ok = 0; return 0; }
+         return t->data[voff];
+      }
+      return stbi__tif_get16(t, voff, ok);
+   }
+   if (type == 4) { // LONG
+      if (count == 1)
+         voff = eoff + 8;
+      else {
+         voff = stbi__tif_get32(t, eoff+8, ok);
+         if (!*ok) return 0;
+         voff += (size_t) idx * 4;
+      }
+      return stbi__tif_get32(t, voff, ok);
+   }
+   *ok = 0; // unsupported field type
+   return 0;
+}
+
+static int stbi__tif_find(stbi__tif *t, size_t ifd, int nentries, int tag, size_t *eoff)
+{
+   int i;
+   for (i = 0; i < nentries; ++i) {
+      size_t e = ifd + 2 + (size_t) i * 12;
+      int ok = 1;
+      if (stbi__tif_get16(t, e, &ok) == tag && ok) {
+         *eoff = e;
+         return 1;
+      }
+   }
+   return 0;
+}
+
+typedef struct
+{
+   stbi__uint32 width, height;
+   stbi__uint32 rows_per_strip;
+   stbi__uint32 num_strips;
+   int bits_per_sample; // 8 or 16
+   int samples;         // 1..4
+   int compression;     // 1, 5 or 32773
+   int photometric;     // 0, 1 or 2
+   int predictor;       // 1 or 2
+   stbi__uint32 *strip_offsets;
+   stbi__uint32 *strip_counts;
+} stbi__tif_tags;
+
+// parse the first IFD; on success tg->strip_offsets/strip_counts are malloc'd
+// and must be freed by the caller
+static int stbi__tif_parse_ifd(stbi__tif *t, stbi__tif_tags *tg)
+{
+   int ok = 1;
+   size_t ifd, e;
+   stbi__uint32 v, n_off, n_cnt, i;
+   int nentries;
+
+   memset(tg, 0, sizeof(*tg));
+
+   if (t->len < 8)
+      return stbi__err("corrupt TIFF", "TIFF header too short");
+   ifd = stbi__tif_get32(t, 4, &ok);
+   if (!ok || ifd > t->len || t->len - ifd < 2)
+      return stbi__err("corrupt TIFF", "bad first IFD offset");
+   nentries = stbi__tif_get16(t, ifd, &ok);
+   if (!ok || (size_t) nentries * 12 + 2 + 4 > t->len - ifd)
+      return stbi__err("corrupt TIFF", "IFD extends past end of file");
+
+   if (!stbi__tif_find(t, ifd, nentries, 256, &e))
+      return stbi__err("corrupt TIFF", "missing ImageWidth tag");
+   tg->width = stbi__tif_tagval(t, e, 0, &ok);
+   if (!stbi__tif_find(t, ifd, nentries, 257, &e))
+      return stbi__err("corrupt TIFF", "missing ImageLength tag");
+   tg->height = stbi__tif_tagval(t, e, 0, &ok);
+   if (!ok || tg->width == 0 || tg->height == 0 || tg->width > 0x7fffffff || tg->height > 0x7fffffff)
+      return stbi__err("corrupt TIFF", "bad image dimensions");
+
+   tg->samples = 1;
+   if (stbi__tif_find(t, ifd, nentries, 277, &e)) {
+      tg->samples = (int) stbi__tif_tagval(t, e, 0, &ok);
+      if (!ok || tg->samples < 1 || tg->samples > 4)
+         return stbi__err("unsupported TIFF", "bad SamplesPerPixel");
+   }
+
+   tg->bits_per_sample = 0;
+   if (stbi__tif_find(t, ifd, nentries, 258, &e)) {
+      tg->bits_per_sample = (int) stbi__tif_tagval(t, e, 0, &ok);
+      // all samples must share the same bit depth
+      for (i = 1; ok && i < (stbi__uint32) tg->samples; ++i)
+         if ((int) stbi__tif_tagval(t, e, i, &ok) != tg->bits_per_sample)
+            return stbi__err("unsupported TIFF", "mixed BitsPerSample");
+   }
+   if (!ok || (tg->bits_per_sample != 8 && tg->bits_per_sample != 16))
+      return stbi__err("unsupported TIFF", "only 8-bit and 16-bit samples supported");
+
+   tg->compression = 1;
+   if (stbi__tif_find(t, ifd, nentries, 259, &e))
+      tg->compression = (int) stbi__tif_tagval(t, e, 0, &ok);
+   if (!ok || (tg->compression != 1 && tg->compression != 5 && tg->compression != 32773))
+      return stbi__err("unsupported TIFF", "only uncompressed, LZW and PackBits supported");
+
+   // photometric has no default in the spec; be lenient with files that omit it
+   tg->photometric = (tg->samples >= 3) ? 2 : 1;
+   if (stbi__tif_find(t, ifd, nentries, 262, &e))
+      tg->photometric = (int) stbi__tif_tagval(t, e, 0, &ok);
+   if (!ok || tg->photometric > 2)
+      return stbi__err("unsupported TIFF", "only grayscale and RGB photometric supported");
+   if (tg->photometric == 2 && tg->samples < 3)
+      return stbi__err("corrupt TIFF", "RGB photometric with too few samples");
+
+   if (stbi__tif_find(t, ifd, nentries, 284, &e)) { // PlanarConfiguration
+      if (stbi__tif_tagval(t, e, 0, &ok) != 1 || !ok)
+         return stbi__err("unsupported TIFF", "only chunky (planar config 1) supported");
+   }
+
+   tg->predictor = 1;
+   if (stbi__tif_find(t, ifd, nentries, 317, &e)) {
+      tg->predictor = (int) stbi__tif_tagval(t, e, 0, &ok);
+      if (!ok || (tg->predictor != 1 && tg->predictor != 2))
+         return stbi__err("unsupported TIFF", "unsupported Predictor");
+   }
+
+   tg->rows_per_strip = tg->height;
+   if (stbi__tif_find(t, ifd, nentries, 278, &e)) {
+      v = stbi__tif_tagval(t, e, 0, &ok);
+      if (!ok || v == 0)
+         return stbi__err("corrupt TIFF", "bad RowsPerStrip");
+      if (v < tg->rows_per_strip)
+         tg->rows_per_strip = v;
+   }
+   tg->num_strips = (tg->height + tg->rows_per_strip - 1) / tg->rows_per_strip;
+
+   if (!stbi__tif_find(t, ifd, nentries, 273, &e))
+      return stbi__err("corrupt TIFF", "missing StripOffsets tag");
+   n_off = stbi__tif_get32(t, e+4, &ok);
+   if (!stbi__tif_find(t, ifd, nentries, 279, &e))
+      return stbi__err("corrupt TIFF", "missing StripByteCounts tag");
+   n_cnt = stbi__tif_get32(t, e+4, &ok);
+   if (!ok || n_off < tg->num_strips || n_cnt < tg->num_strips)
+      return stbi__err("corrupt TIFF", "strip table smaller than image requires");
+
+   tg->strip_offsets = (stbi__uint32 *) stbi__malloc((size_t) tg->num_strips * sizeof(stbi__uint32));
+   tg->strip_counts  = (stbi__uint32 *) stbi__malloc((size_t) tg->num_strips * sizeof(stbi__uint32));
+   if (tg->strip_offsets == NULL || tg->strip_counts == NULL) {
+      STBI_FREE(tg->strip_offsets); STBI_FREE(tg->strip_counts);
+      tg->strip_offsets = tg->strip_counts = NULL;
+      return stbi__err("outofmem", "Out of memory");
+   }
+   {
+      size_t eo, ec;
+      stbi__tif_find(t, ifd, nentries, 273, &eo);
+      stbi__tif_find(t, ifd, nentries, 279, &ec);
+      for (i = 0; i < tg->num_strips; ++i) {
+         int ok2 = 1;
+         tg->strip_offsets[i] = stbi__tif_tagval(t, eo, i, &ok2);
+         tg->strip_counts[i]  = stbi__tif_tagval(t, ec, i, &ok2);
+         if (!ok2) {
+            STBI_FREE(tg->strip_offsets); STBI_FREE(tg->strip_counts);
+            tg->strip_offsets = tg->strip_counts = NULL;
+            return stbi__err("corrupt TIFF", "bad strip table");
+         }
+      }
+   }
+   return 1;
+}
+
+// decode one PackBits strip; must produce exactly dstlen bytes
+static int stbi__tif_packbits(const stbi_uc *src, size_t srclen, stbi_uc *dst, size_t dstlen)
+{
+   size_t si = 0, di = 0;
+   while (di < dstlen) {
+      int n;
+      if (si >= srclen) return 0;
+      n = (int) (signed char) src[si++];
+      if (n >= 0) {          // n+1 literal bytes follow
+         size_t count = (size_t) n + 1;
+         if (count > srclen - si || count > dstlen - di) return 0;
+         memcpy(dst + di, src + si, count);
+         si += count;
+         di += count;
+      } else if (n != -128) { // replicate next byte 1-n (2..128) times
+         size_t count = (size_t) (1 - n);
+         if (si >= srclen || count > dstlen - di) return 0;
+         memset(dst + di, src[si++], count);
+         di += count;
+      }                        // n == -128: no-op
+   }
+   return 1;
+}
+
+// decode one TIFF-LZW strip (MSB-first codes, "early change" width growth);
+// must produce exactly dstlen bytes
+static int stbi__tif_lzw(const stbi_uc *src, size_t srclen, stbi_uc *dst, size_t dstlen)
+{
+   // table entries 0..255 are the literals, 256=clear, 257=eoi, 258..4095 built up
+   stbi__uint16 *prefix;  // prefix code of each string
+   stbi_uc      *suffix;  // last byte of each string
+   stbi_uc      *stack;   // string emission stack
+   stbi_uc      *table;
+   stbi__uint32 reservoir = 0;
+   int bits_in_reservoir = 0, width = 9, free_code = 258, old = -1;
+   size_t spos = 0, di = 0;
+   int ok;
+
+   table = (stbi_uc *) stbi__malloc(4096 * (sizeof(stbi__uint16) + 2 * sizeof(stbi_uc)));
+   if (table == NULL) {
+      stbi__err("outofmem", "Out of memory");
+      return 0;
+   }
+   prefix = (stbi__uint16 *) table;
+   suffix = table + 4096 * sizeof(stbi__uint16);
+   stack  = suffix + 4096;
+
+   for (;;) {
+      int code, incode, first, sp, kwkwk;
+      // read one MSB-first code of `width` bits
+      while (bits_in_reservoir < width) {
+         if (spos >= srclen) {
+            code = -1;
+            goto have_code;
+         }
+         reservoir = (reservoir << 8) | src[spos++];
+         bits_in_reservoir += 8;
+      }
+      bits_in_reservoir -= width;
+      code = (int) ((reservoir >> bits_in_reservoir) & ((1u << width) - 1));
+   have_code:
+      if (code < 0) // ran out of input: fine only if the strip is already complete
+         break;
+      if (code == 256) { // clear
+         width = 9;
+         free_code = 258;
+         old = -1;
+         continue;
+      }
+      if (code == 257) // end of information
+         break;
+      if (old < 0) { // first code after a clear must be a literal
+         if (code >= 256 || di >= dstlen) goto done;
+         dst[di++] = (stbi_uc) code;
+         old = code;
+         continue;
+      }
+      incode = code;
+      kwkwk = (code == free_code);
+      sp = 0;
+      if (kwkwk) // KwKwK case: emit string(old) + first(string(old))
+         code = old;
+      else if (code > free_code)
+         goto done;
+      // walk the prefix chain, pushing the string onto the stack in reverse;
+      // prefix[c] < c always, so this terminates in at most 4096-258 steps
+      while (code >= 256) {
+         if (sp >= 4096) goto done;
+         stack[sp++] = suffix[code];
+         code = prefix[code];
+      }
+      first = code; // root literal = first byte of the emitted string
+      if (sp >= 4096) goto done;
+      stack[sp++] = (stbi_uc) first;
+      // add string(old) + first to the table ("early change": the code
+      // width grows as soon as the next free entry reaches MAXCODE-1,
+      // matching libtiff's decoder)
+      if (free_code < 4096) {
+         prefix[free_code] = (stbi__uint16) old;
+         suffix[free_code] = (stbi_uc) first;
+         ++free_code;
+         if (free_code > (1 << width) - 2 && width < 12)
+            ++width;
+      }
+      // emit the string (stack holds it in reverse)
+      if ((size_t) sp > dstlen - di) goto done;
+      while (sp > 0)
+         dst[di++] = stack[--sp];
+      if (kwkwk) { // KwKwK: one trailing copy of the first byte
+         if (di >= dstlen) goto done;
+         dst[di++] = (stbi_uc) first;
+      }
+      old = incode;
+   }
+done:
+   ok = (di == dstlen);
+   STBI_FREE(table);
+   if (!ok)
+      stbi__err("corrupt TIFF", "LZW strip did not decode to the expected size");
+   return ok;
+}
+
+// apply horizontal-differencing predictor (tag 317 = 2) in place,
+// in the file's sample endianness
+static void stbi__tif_predict(stbi_uc *buf, size_t row_samples, int rows, int spp, int bpc, int le)
+{
+   int r;
+   size_t j;
+   for (r = 0; r < rows; ++r) {
+      stbi_uc *row = buf + (size_t) r * row_samples * bpc;
+      if (bpc == 1) {
+         for (j = (size_t) spp; j < row_samples; ++j)
+            row[j] = (stbi_uc) (row[j] + row[j - spp]);
+      } else {
+         for (j = (size_t) spp; j < row_samples; ++j) {
+            stbi__uint16 v, p;
+            const stbi_uc *a = row + 2*j, *b = row + 2*(j - spp);
+            if (le) { v = (stbi__uint16)(a[0] | (a[1] << 8)); p = (stbi__uint16)(b[0] | (b[1] << 8)); }
+            else    { v = (stbi__uint16)((a[0] << 8) | a[1]); p = (stbi__uint16)((b[0] << 8) | b[1]); }
+            v = (stbi__uint16) (v + p);
+            if (le) { row[2*j] = (stbi_uc) v; row[2*j+1] = (stbi_uc) (v >> 8); }
+            else    { row[2*j] = (stbi_uc) (v >> 8); row[2*j+1] = (stbi_uc) v; }
+         }
+      }
+   }
+}
+
+// buffer the whole input: use the caller's buffer directly for memory input,
+// otherwise slurp the stream
+static const stbi_uc *stbi__tif_buffer(stbi__context *s, stbi__tif *t, stbi_uc **alloced)
+{
+   size_t cap, len;
+   stbi_uc *buf;
+   *alloced = NULL;
+   stbi__rewind(s);
+   if (s->io.read == NULL) {
+      t->data = s->img_buffer_original;
+      t->len = (size_t) (s->img_buffer_original_end - s->img_buffer_original);
+      return t->data;
+   }
+   cap = 1 << 16;
+   len = 0;
+   buf = (stbi_uc *) stbi__malloc(cap);
+   if (buf == NULL)
+      return NULL;
+   while (!stbi__at_eof(s)) {
+      if (len == cap) {
+         stbi_uc *nb;
+         if (cap > ((size_t) -1) / 2) {
+            STBI_FREE(buf);
+            return NULL;
+         }
+         cap *= 2;
+         nb = (stbi_uc *) stbi__malloc(cap);
+         if (nb == NULL) {
+            STBI_FREE(buf);
+            return NULL;
+         }
+         memcpy(nb, buf, len);
+         STBI_FREE(buf);
+         buf = nb;
+      }
+      buf[len++] = stbi__get8(s);
+   }
+   t->data = buf;
+   t->len = len;
+   *alloced = buf;
+   return buf;
+}
+
+static int stbi__tif_setup(stbi__context *s, stbi__tif *t, stbi_uc **alloced, stbi__tif_tags *tg)
+{
+   int b0, b1;
+   if (stbi__tif_buffer(s, t, alloced) == NULL)
+      return stbi__err("outofmem", "Out of memory");
+   if (t->len < 4)
+      return 0; // not a TIFF, let other formats report the error
+   b0 = t->data[0]; b1 = t->data[1];
+   if (b0 == 'I' && b1 == 'I') t->le = 1;
+   else if (b0 == 'M' && b1 == 'M') t->le = 0;
+   else return 0;
+   return stbi__tif_parse_ifd(t, tg);
+}
+
+static void *stbi__tif_load(stbi__context *s, int *x, int *y, int *comp, int req_comp, stbi__result_info *ri)
+{
+   stbi__tif t;
+   stbi__tif_tags tg;
+   stbi_uc *alloced = NULL, *out = NULL, *stripbuf = NULL;
+   int bpc, invert;
+   size_t outlen, striplen;
+   stbi__uint32 i;
+
+   if (!stbi__tif_setup(s, &t, &alloced, &tg)) {
+      STBI_FREE(alloced);
+      return NULL; // stbi__tif_parse_ifd already set the failure reason
+   }
+
+   bpc = tg.bits_per_sample / 8;
+   invert = (tg.photometric == 0);
+
+   if (!stbi__mad4sizes_valid((int) tg.width, (int) tg.height, tg.samples, bpc, 0)) {
+      STBI_FREE(alloced); STBI_FREE(tg.strip_offsets); STBI_FREE(tg.strip_counts);
+      return stbi__errpuc("too large", "Image too large to decode");
+   }
+   outlen = (size_t) tg.width * tg.height * tg.samples * bpc;
+   striplen = (size_t) tg.width * tg.rows_per_strip * tg.samples * bpc;
+
+   out = (stbi_uc *) stbi__malloc(outlen);
+   if (tg.compression != 1 || tg.predictor != 1)
+      stripbuf = (stbi_uc *) stbi__malloc(striplen);
+   if (out == NULL || (stripbuf == NULL && (tg.compression != 1 || tg.predictor != 1))) {
+      STBI_FREE(alloced); STBI_FREE(tg.strip_offsets); STBI_FREE(tg.strip_counts);
+      STBI_FREE(out); STBI_FREE(stripbuf);
+      return stbi__errpuc("outofmem", "Out of memory");
+   }
+
+   for (i = 0; i < tg.num_strips; ++i) {
+      stbi__uint32 rows = tg.height - i * tg.rows_per_strip;
+      size_t off = tg.strip_offsets[i], cnt = tg.strip_counts[i];
+      size_t need;
+      const stbi_uc *src = NULL;
+      stbi_uc *dst;
+      int bad = 0;
+      if (rows > tg.rows_per_strip)
+         rows = tg.rows_per_strip;
+      need = (size_t) tg.width * rows * tg.samples * bpc;
+      // bounds-check the strip against the file before touching it
+      if (off > t.len || cnt > t.len - off)
+         bad = 1;
+      if (!bad) {
+         src = t.data + off;
+         if (tg.compression == 1 && tg.predictor == 1) {
+            if (cnt < need)
+               bad = 1;
+         } else if (tg.compression == 1) {
+            if (cnt < need)
+               bad = 1;
+            else {
+               memcpy(stripbuf, src, need);
+               src = stripbuf;
+            }
+         } else if (tg.compression == 32773) {
+            if (!stbi__tif_packbits(src, cnt, stripbuf, need))
+               bad = 1;
+            src = stripbuf;
+         } else { // LZW
+            if (!stbi__tif_lzw(src, cnt, stripbuf, need))
+               bad = 1;
+            src = stripbuf;
+         }
+      }
+      if (bad) {
+         STBI_FREE(alloced); STBI_FREE(tg.strip_offsets); STBI_FREE(tg.strip_counts);
+         STBI_FREE(out); STBI_FREE(stripbuf);
+         return stbi__errpuc("corrupt TIFF", "strip data is corrupt or truncated");
+      }
+      if (tg.predictor == 2)
+         stbi__tif_predict(stripbuf, (size_t) tg.width * tg.samples, (int) rows, tg.samples, bpc, t.le);
+      // emit: endianness conversion (16-bit) and photometric inversion
+      dst = out + (size_t) i * tg.rows_per_strip * tg.width * tg.samples * bpc;
+      if (bpc == 1) {
+         if (invert) {
+            size_t j;
+            for (j = 0; j < need; ++j)
+               dst[j] = (stbi_uc) (255 - src[j]);
+         } else {
+            memcpy(dst, src, need);
+         }
+      } else {
+         stbi__uint16 *d16 = (stbi__uint16 *) dst;
+         size_t j, n = need / 2;
+         for (j = 0; j < n; ++j) {
+            stbi__uint16 v;
+            if (t.le) v = (stbi__uint16) (src[2*j] | (src[2*j+1] << 8));
+            else      v = (stbi__uint16) ((src[2*j] << 8) | src[2*j+1]);
+            d16[j] = invert ? (stbi__uint16) (65535 - v) : v;
+         }
+      }
+   }
+
+   STBI_FREE(alloced);
+   STBI_FREE(tg.strip_offsets);
+   STBI_FREE(tg.strip_counts);
+   STBI_FREE(stripbuf);
+
+   s->img_x = tg.width;
+   s->img_y = tg.height;
+   s->img_n = tg.samples;
+   ri->bits_per_channel = tg.bits_per_sample;
+   *x = (int) tg.width;
+   *y = (int) tg.height;
+   *comp = tg.samples;
+
+   if (req_comp && req_comp != tg.samples) {
+      if (tg.bits_per_sample == 16)
+         out = (stbi_uc *) stbi__convert_format16((stbi__uint16 *) out, tg.samples, req_comp, tg.width, tg.height);
+      else
+         out = stbi__convert_format(out, tg.samples, req_comp, tg.width, tg.height);
+      if (out == NULL)
+         return NULL; // stbi__convert_format*/16 free the input on failure
+   }
+   return out;
+}
+
+static int stbi__tif_info(stbi__context *s, stbi_info_res *res)
+{
+   stbi__tif t;
+   stbi__tif_tags tg;
+   stbi_uc *alloced = NULL;
+   if (!stbi__tif_setup(s, &t, &alloced, &tg)) {
+      STBI_FREE(alloced);
+      return 0;
+   }
+   STBI_FREE(alloced);
+   res->x = (int) tg.width;
+   res->y = (int) tg.height;
+   res->comp = tg.samples;
+   res->is_16_bit = tg.bits_per_sample == 16;
+   res->type = STBI_type_tif;
+   STBI_FREE(tg.strip_offsets);
+   STBI_FREE(tg.strip_counts);
+   return 1;
+}
+#endif
+
 static stbi_info_res stbi__info2_main(stbi__context *s)
 {
    stbi_info_res res;
@@ -7405,6 +8003,10 @@ static stbi_info_res stbi__info2_main(stbi__context *s)
 
    #ifndef STBI_NO_PNM
    if (stbi__pnm_info(s, &res)) return res;
+   #endif
+
+   #ifndef STBI_NO_TIF
+   if (stbi__tif_info(s, &res)) return res;
    #endif
 
    #ifndef STBI_NO_HDR
