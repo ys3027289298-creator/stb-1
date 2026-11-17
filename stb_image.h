@@ -586,6 +586,34 @@ STBIDEF void stbi_set_unpremultiply_on_load_thread(int flag_true_if_should_unpre
 STBIDEF void stbi_convert_iphone_png_to_rgb_thread(int flag_true_if_should_convert);
 STBIDEF void stbi_set_flip_vertically_on_load_thread(int flag_true_if_should_flip);
 
+// CLAHE (contrast-limited adaptive histogram equalization) for 8-bit images.
+//
+// Plain global histogram equalization remaps the whole image through one
+// curve, which can collapse local detail. CLAHE equalizes each contextual
+// tile separately, clips each histogram at clip_limit so noise is not
+// amplified without bound, and bilinearly interpolates the four neighboring
+// tile curves at every pixel so tile boundaries do not create seams.
+//
+// w, h, comp describe an interleaved image with comp in 1..4 (as returned by
+// stbi_load). src and dst must each hold w*h*comp bytes; they may point to
+// the same buffer. The source is never modified if src != dst.
+//
+// tiles_x, tiles_y: number of contextual tiles in each direction. Must be
+//                   >= 1, <= the image dimensions, <= 256 each, and the
+//                   product must be <= 4096.
+// clip_limit:       normalized clip limit (bin count is clip_limit * tile
+//                   area / 256). Must be finite and in [1, 10000]. Larger
+//                   values allow more local contrast and more noise.
+// luminance_only:   if nonzero, only luminance is equalized and the result is
+//                   applied back to RGB with the same per-pixel scale; alpha
+//                   is always left untouched. If zero, every color channel is
+//                   equalized independently (alpha still untouched).
+//
+// Returns 1 on success. On invalid parameters or allocation failure returns 0
+// and stbi_failure_reason() describes the problem.
+STBIDEF int stbi_clahe_apply(int w, int h, int comp, const stbi_uc *src, stbi_uc *dst,
+                             int tiles_x, int tiles_y, float clip_limit, int luminance_only);
+
 // ZLIB client - used by PNG, available for other purposes
 
 STBIDEF char *stbi_zlib_decode_malloc_guesssize(const char *buffer, int len, int initial_size, int *outlen);
@@ -7549,6 +7577,269 @@ STBIDEF int stbi_is_16_bit_from_callbacks(stbi_io_callbacks const *c, void *user
    r = stbi__info2_main(&s);
    stbi__stop(&s);
    return r.type != STBI_type_unsupported && r.is_16_bit;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// CLAHE (contrast-limited adaptive histogram equalization)
+//
+// Implementation notes:
+//  - the image is split into a grid of contextual tiles; each tile gets its
+//    own 256-bin histogram per processed channel
+//  - each tile histogram is clipped at a normalized limit and the clipped
+//    excess is redistributed so the mapping still covers the tile's pixels
+//  - the per-tile equalization curves are bilinearly interpolated at every
+//    pixel, which removes visible tile seams
+//  - in luminance mode only Y is equalized and RGB is rescaled by the same
+//    factor; alpha is never touched
+//
+
+#define STBI__CLAHE_BINS 256
+
+static unsigned char stbi__clahe_clamp8(int v)
+{
+   if (v < 0) return 0;
+   if (v > 255) return 255;
+   return (unsigned char) v;
+}
+
+static float stbi__clahe_luma(const stbi_uc *p)
+{
+   return 0.299f*(float)p[0] + 0.587f*(float)p[1] + 0.114f*(float)p[2];
+}
+
+// clip hist at limit, redistribute the excess, and turn the result into a
+// 256-entry equalization curve
+static void stbi__clahe_make_lut(const int *hist, int limit, unsigned char *lut)
+{
+   int i, excess, each, residual;
+   double total = 0.0, cdf = 0.0;
+
+   if (limit < 1) limit = 1;
+
+   // the total (and hence the distribution) is unchanged by clipping and
+   // redistribution, so it can be computed from the raw histogram. all
+   // accumulation is in double because a single tile can hold very many
+   // pixels while individual bin counts are still ints.
+   for (i = 0; i < STBI__CLAHE_BINS; ++i)
+      total += (double) hist[i];
+
+   if (total < 1.0) {
+      for (i = 0; i < STBI__CLAHE_BINS; ++i)
+         lut[i] = (unsigned char) i;
+      return;
+   }
+
+   excess = 0;
+   for (i = 0; i < STBI__CLAHE_BINS; ++i)
+      if (hist[i] > limit)
+         excess += hist[i] - limit;
+
+   // spread the clipped excess evenly over all bins
+   each = excess / STBI__CLAHE_BINS;
+   residual = excess % STBI__CLAHE_BINS;
+
+   for (i = 0; i < STBI__CLAHE_BINS; ++i) {
+      double h = (double) (hist[i] > limit ? limit : hist[i]) + (double) each;
+      if (residual && (i * residual) / STBI__CLAHE_BINS != ((i + 1) * residual) / STBI__CLAHE_BINS)
+         h += 1.0;
+      cdf += h;
+      {
+         double v = cdf * 255.0 / total + 0.5;
+         if (v < 0.0) v = 0.0;
+         if (v > 255.0) v = 255.0;
+         lut[i] = (unsigned char) v;
+      }
+   }
+}
+
+// bilinear interpolation of the four surrounding tile LUTs at one intensity
+static float stbi__clahe_sample(unsigned char const *lut, int tiles_x, int nch, int ch,
+                                int tx0, int tx1, int ty0, int ty1,
+                                float wx, float wy, int q)
+{
+   int b00 = (((ty0 * tiles_x + tx0) * nch + ch) * STBI__CLAHE_BINS) + q;
+   int b10 = (((ty0 * tiles_x + tx1) * nch + ch) * STBI__CLAHE_BINS) + q;
+   int b01 = (((ty1 * tiles_x + tx0) * nch + ch) * STBI__CLAHE_BINS) + q;
+   int b11 = (((ty1 * tiles_x + tx1) * nch + ch) * STBI__CLAHE_BINS) + q;
+   float top = (float) lut[b00] + ((float) lut[b10] - (float) lut[b00]) * wx;
+   float bot = (float) lut[b01] + ((float) lut[b11] - (float) lut[b01]) * wx;
+   return top + (bot - top) * wy;
+}
+
+STBIDEF int stbi_clahe_apply(int w, int h, int comp, const stbi_uc *src, stbi_uc *dst,
+                             int tiles_x, int tiles_y, float clip_limit, int luminance_only)
+{
+   int xb[257], yb[257];
+   int ntiles, nch, luma_mode;
+   int tx, ty, i, y, x, c;
+   unsigned char *lut;
+   float stepx, stepy;
+
+   if (src == NULL || dst == NULL)
+      return stbi__err("bad CLAHE buffer", "CLAHE requires non-NULL source and destination");
+   if (w <= 0 || h <= 0 || comp < 1 || comp > 4)
+      return stbi__err("bad CLAHE image", "CLAHE requires w>0, h>0, and comp in 1..4");
+   if (!stbi__mad3sizes_valid(w, h, comp, 0))
+      return stbi__err("too large", "Image too large for CLAHE");
+   if (tiles_x < 1 || tiles_y < 1)
+      return stbi__err("bad CLAHE tiles", "CLAHE tile counts must be at least 1");
+   if (tiles_x > w || tiles_y > h)
+      return stbi__err("bad CLAHE tiles", "CLAHE tile counts must not exceed the image dimensions");
+   if (tiles_x > 256 || tiles_y > 256 || tiles_x > 4096 / tiles_y)
+      return stbi__err("bad CLAHE tiles", "CLAHE tile grid is too large (max 256x256 and 4096 tiles)");
+   if (!(clip_limit >= 1.0f && clip_limit <= 10000.0f))
+      return stbi__err("bad CLAHE clip limit", "CLAHE clip limit must be finite and between 1 and 10000");
+
+   luma_mode = luminance_only && comp >= 3;
+   nch = (comp >= 3 && !luma_mode) ? 3 : 1;
+   ntiles = tiles_x * tiles_y;
+
+   lut = (unsigned char *) stbi__malloc_mad3(ntiles, nch, STBI__CLAHE_BINS, 0);
+   if (lut == NULL)
+      return stbi__err("outofmem", "Out of memory");
+
+   // tile boundaries: contiguous, cover the whole image, at least 1 pixel
+   xb[0] = 0;
+   {
+      int base = w / tiles_x, rem = w % tiles_x, pos = 0;
+      for (i = 0; i < tiles_x; ++i) {
+         pos += base + (i < rem ? 1 : 0);
+         xb[i + 1] = pos;
+      }
+   }
+   yb[0] = 0;
+   {
+      int base = h / tiles_y, rem = h % tiles_y, pos = 0;
+      for (i = 0; i < tiles_y; ++i) {
+         pos += base + (i < rem ? 1 : 0);
+         yb[i + 1] = pos;
+      }
+   }
+
+   // build one clipped, equalized LUT per tile and channel
+   for (ty = 0; ty < tiles_y; ++ty) {
+      int y0 = yb[ty], y1 = yb[ty + 1];
+      for (tx = 0; tx < tiles_x; ++tx) {
+         int x0 = xb[tx], x1 = xb[tx + 1];
+         int area = (x1 - x0) * (y1 - y0);
+         float flimit = clip_limit * (float) area / (float) STBI__CLAHE_BINS;
+         int limit;
+         int hist[3][STBI__CLAHE_BINS];
+
+         if (flimit < 1.0f)
+            limit = 1;
+         else if (flimit >= (float) area)
+            limit = area;
+         else
+            limit = (int) (flimit + 0.5f);
+
+         for (c = 0; c < nch; ++c)
+            for (i = 0; i < STBI__CLAHE_BINS; ++i)
+               hist[c][i] = 0;
+
+         for (y = y0; y < y1; ++y) {
+            const stbi_uc *p = src + (y * w + x0) * comp;
+            if (luma_mode) {
+               for (x = x0; x < x1; ++x, p += comp) {
+                  int q = (int) (stbi__clahe_luma(p) + 0.5f);
+                  if (q < 0) q = 0; else if (q > 255) q = 255;
+                  hist[0][q]++;
+               }
+            } else if (comp <= 2) {
+               for (x = x0; x < x1; ++x, p += comp)
+                  hist[0][p[0]]++;
+            } else {
+               for (x = x0; x < x1; ++x, p += comp) {
+                  hist[0][p[0]]++;
+                  hist[1][p[1]]++;
+                  hist[2][p[2]]++;
+               }
+            }
+         }
+
+         for (c = 0; c < nch; ++c)
+            stbi__clahe_make_lut(hist[c], limit,
+                                 lut + (((ty * tiles_x + tx) * nch + c) * STBI__CLAHE_BINS));
+      }
+   }
+
+   // apply the interpolated curves; interpolation uses tile centers so the
+   // mapping is continuous across tile borders
+   stepx = (float) tiles_x / (float) w;
+   stepy = (float) tiles_y / (float) h;
+
+   for (y = 0; y < h; ++y) {
+      float fy = ((float) y + 0.5f) * stepy - 0.5f;
+      int ty0, ty1;
+      float wy;
+      const stbi_uc *p = src + y * w * comp;
+      stbi_uc *d = dst + y * w * comp;
+
+      if (fy <= 0.0f) {
+         ty0 = ty1 = 0;
+         wy = 0.0f;
+      } else if (fy >= (float) (tiles_y - 1)) {
+         ty0 = ty1 = tiles_y - 1;
+         wy = 0.0f;
+      } else {
+         ty0 = (int) fy;
+         ty1 = ty0 + 1;
+         wy = fy - (float) ty0;
+      }
+
+      for (x = 0; x < w; ++x, p += comp, d += comp) {
+         float fx = ((float) x + 0.5f) * stepx - 0.5f;
+         int tx0, tx1;
+         float wx;
+
+         if (fx <= 0.0f) {
+            tx0 = tx1 = 0;
+            wx = 0.0f;
+         } else if (fx >= (float) (tiles_x - 1)) {
+            tx0 = tx1 = tiles_x - 1;
+            wx = 0.0f;
+         } else {
+            tx0 = (int) fx;
+            tx1 = tx0 + 1;
+            wx = fx - (float) tx0;
+         }
+
+         if (luma_mode) {
+            float f = stbi__clahe_luma(p);
+            float g = f, t, v0, v1, mapped, scale;
+            int q0, q1;
+
+            if (g < 0.0f) g = 0.0f; else if (g > 255.0f) g = 255.0f;
+            q0 = (int) g;
+            q1 = q0 < 255 ? q0 + 1 : 255;
+            t = g - (float) q0;
+
+            v0 = stbi__clahe_sample(lut, tiles_x, nch, 0, tx0, tx1, ty0, ty1, wx, wy, q0);
+            v1 = stbi__clahe_sample(lut, tiles_x, nch, 0, tx0, tx1, ty0, ty1, wx, wy, q1);
+            mapped = v0 + (v1 - v0) * t;
+
+            scale = f > 0.0f ? mapped / f : 0.0f;
+            d[0] = stbi__clahe_clamp8((int) ((float) p[0] * scale + 0.5f));
+            d[1] = stbi__clahe_clamp8((int) ((float) p[1] * scale + 0.5f));
+            d[2] = stbi__clahe_clamp8((int) ((float) p[2] * scale + 0.5f));
+            if (comp == 4) d[3] = p[3];
+         } else if (comp <= 2) {
+            float v = stbi__clahe_sample(lut, tiles_x, nch, 0, tx0, tx1, ty0, ty1, wx, wy, p[0]);
+            d[0] = stbi__clahe_clamp8((int) (v + 0.5f));
+            if (comp == 2) d[1] = p[1];
+         } else {
+            for (c = 0; c < 3; ++c) {
+               float v = stbi__clahe_sample(lut, tiles_x, nch, c, tx0, tx1, ty0, ty1, wx, wy, p[c]);
+               d[c] = stbi__clahe_clamp8((int) (v + 0.5f));
+            }
+            if (comp == 4) d[3] = p[3];
+         }
+      }
+   }
+
+   STBI_FREE(lut);
+   return 1;
 }
 
 #endif // STB_IMAGE_IMPLEMENTATION
