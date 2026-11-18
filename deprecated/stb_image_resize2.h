@@ -105,7 +105,7 @@ in the stb_image_resize repository, currently:
 
 
 
-/* stb_image_resize2 - v2.18 - public domain image resizing
+/* stb_image_resize2 - v2.19 - public domain image resizing
 
    by Jeff Roberts (v2) and Jorge L Rodriguez
    http://github.com/nothings/stb
@@ -436,7 +436,12 @@ in the stb_image_resize repository, currently:
       Nathan Reed: warning fixes for 1.0
 
    REVISIONS
-      2.18 (2026-03-25) fixed coefficient calculation when skipping a coefficient off 
+      2.19 (2026-11-18) added anti-aliased downsampling API: area-weighted
+                          box/triangle kernels with optional gamma-correct
+                          (linear-light) averaging via stbir_downsample_uint8()
+                          and stbir_downsample_float(); existing functions
+                          unchanged.
+      2.18 (2026-03-25) fixed coefficient calculation when skipping a coefficient off
                           the left side of the window, added non-aligned access safe 
                           memcpy mode for scalar path, fixed various typos, and fixed 
                           define error in the float clamp output mode. 
@@ -882,6 +887,74 @@ STBIRDEF void stbir_resize_split_profile_info( STBIR_PROFILE_INFO * out_info, ST
 //===============================================================
 
 #endif
+
+
+//===============================================================
+// Anti-aliased downsampling API (area-weighted averaging)
+//
+// These functions only downsample (output dimensions must be strictly
+// smaller than input dimensions). Every output pixel is the
+// area-weighted average of the input pixels its footprint covers, so
+// shrinking an image no longer drops samples (nearest-neighbor) or
+// undersamples the source (point-sampled bilinear), which is what makes
+// naive thumbnails look grey and muddy.
+//
+//   stbir_ds_kernel selects the reconstruction kernel:
+//     STBIR_DS_BOX      - box kernel, exact area-weighted average
+//     STBIR_DS_TRIANGLE - triangular (tent) kernel, area weighted with
+//                         a linear ramp; slightly smoother than box
+//
+//   stbir_ds_color selects where the averaging happens:
+//     STBIR_DS_GAMMA      - average the stored (gamma-encoded) values
+//     STBIR_DS_LINEAR     - decode sRGB -> linear, average in linear
+//                           light, re-encode to sRGB (gamma correct)
+//
+// The configuration struct is stbir_downsample_config; pass NULL to use the
+// default config (triangle kernel, gamma-correct linear averaging).
+// stbir_downsample_config_init() fills every field and returns 0 if the
+// configuration is invalid, 1 otherwise. Any illegal enum value, bad
+// dimension, null pointer or unsupported channel count also makes the
+// resize functions return 0 (1 on success).
+//--------------------------------
+
+typedef enum
+{
+  STBIR_DS_BOX      = 0,  // box (rectangular) kernel: exact area average
+  STBIR_DS_TRIANGLE = 1,  // triangular (tent) kernel
+} stbir_ds_kernel;
+
+typedef enum
+{
+  STBIR_DS_GAMMA  = 0,    // average in the stored gamma-encoded space
+  STBIR_DS_LINEAR = 1,    // average in linear-light (sRGB decode/encode)
+} stbir_ds_color;
+
+typedef struct stbir_downsample_config
+{
+  int kernel;             // stbir_ds_kernel
+  int color_mode;         // stbir_ds_color
+} stbir_downsample_config;
+
+// fills *config with the given choices and validates them (0 = invalid)
+STBIRDEF int stbir_downsample_config_init( stbir_downsample_config * config, int kernel, int color_mode );
+
+// number of scratch bytes a resize needs (0 if the parameters are invalid);
+// does not include input, output or weight-table storage
+STBIRDEF size_t stbir_downsample_scratch_size_bytes( int input_w, int input_h, int output_w, int output_h, int channels );
+
+// 8-bit-per-channel downsample; if output_pixels is NULL the buffer is
+// allocated (with STBIR_MALLOC) and returned to the caller, otherwise
+// the passed pointer is returned on success
+STBIRDEF unsigned char * stbir_downsample_uint8( const unsigned char * input_pixels, int input_w, int input_h, int input_stride_in_bytes,
+                                                       unsigned char * output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                                       int channels, const stbir_downsample_config * config );
+
+// float-per-channel downsample (values are clamped to [0,1] on output)
+STBIRDEF float * stbir_downsample_float( const float * input_pixels, int input_w, int input_h, int input_stride_in_bytes,
+                                               float * output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                               int channels, const stbir_downsample_config * config );
+
+//===============================================================
 
 
 ////   end header file   /////////////////////////////////////////////////////
@@ -8330,6 +8403,414 @@ STBIRDEF void stbir_resize_extended_profile_info( STBIR_PROFILE_INFO * info, STB
 
 #endif // STBIR_PROFILE
 
+//===============================================================
+//
+// Anti-aliased downsampling implementation
+//
+// Separable area-weighted resampling. Each output pixel maps to a
+// scale-wide footprint in input space; every input pixel overlapping
+// the footprint contributes the overlap length (optionally weighted by
+// a triangular kernel) normalized so the weights sum to 1.
+//--------------------------------
+
+#include <math.h>
+
+// sRGB <-> linear transfer functions (IEC 61966-2-1)
+static float stbir__ds_srgb_to_linear( float cs )
+{
+  if ( cs <= 0.04045f )
+    return cs / 12.92f;
+  float c = ( cs + 0.055f ) / 1.055f;
+  return (float) pow( c, 2.4 );
+}
+
+static float stbir__ds_linear_to_srgb( float cl )
+{
+  if ( cl <= 0.0031308f )
+    return cl * 12.92f;
+  return 1.055f * (float) pow( (double) cl, 1.0 / 2.4 ) - 0.055f;
+}
+
+STBIRDEF int stbir_downsample_config_init( stbir_downsample_config * config, int kernel, int color_mode )
+{
+  if ( config == NULL )
+    return 0;
+  if ( kernel != STBIR_DS_BOX && kernel != STBIR_DS_TRIANGLE )
+    return 0;
+  if ( color_mode != STBIR_DS_GAMMA && color_mode != STBIR_DS_LINEAR )
+    return 0;
+  config->kernel     = kernel;
+  config->color_mode = color_mode;
+  return 1;
+}
+
+typedef struct stbir__ds_axis
+{
+  int     out_count;        // number of output samples on this axis
+  int     in_count;         // number of input samples on this axis
+  float   scale;            // input samples per output sample (>1)
+  int *   first;            // first contributing input index per output
+  int *   count;            // number of contributors per output
+  float * weights;          // all weights, packed per output sample
+  int     total_weights;    // number of floats in weights
+} stbir__ds_axis;
+
+// integral of the normalized triangle kernel between a and b;
+// kernel(x) = (support - |x|)/support for |x| <= support.
+// Continuous antiderivative with F(0) = 0:
+//   x <= 0: F(x) = x + x*x/(2*support)
+//   x >= 0: F(x) = x - x*x/(2*support)
+static double stbir__ds_triangle_integral( double a, double b, double support )
+{
+  double fa, fb;
+  if ( b <= 0 ) {
+    fa = a + a*a/(2*support);
+    fb = b + b*b/(2*support);
+  } else if ( a >= 0 ) {
+    fa = a - a*a/(2*support);
+    fb = b - b*b/(2*support);
+  } else {
+    // interval straddles the peak at x=0
+    double fA = a + a*a/(2*support);
+    double fB = b - b*b/(2*support);
+    return fB - fA;
+  }
+  return fb - fa;
+}
+
+static void stbir__ds_free_axis( stbir__ds_axis * axis, void * user_data )
+{
+  if ( axis->first )   { STBIR_FREE( axis->first,   user_data ); axis->first   = NULL; }
+  if ( axis->count )   { STBIR_FREE( axis->count,   user_data ); axis->count   = NULL; }
+  if ( axis->weights ) { STBIR_FREE( axis->weights, user_data ); axis->weights = NULL; }
+}
+
+// builds weights for one axis; returns 0 on allocation failure
+static int stbir__ds_build_axis( stbir__ds_axis * axis, int in_count, int out_count, int kernel, void * user_data )
+{
+  double scale = (double) in_count / (double) out_count;
+  axis->in_count   = in_count;
+  axis->out_count  = out_count;
+  axis->scale      = (float) scale;
+  axis->first      = (int *)   STBIR_MALLOC( sizeof(int)   * (size_t) out_count, user_data );
+  axis->count      = (int *)   STBIR_MALLOC( sizeof(int)   * (size_t) out_count, user_data );
+  if ( axis->first == NULL || axis->count == NULL ) {
+    stbir__ds_free_axis( axis, user_data );
+    return 0;
+  }
+
+  // first pass: determine contributor ranges so the weight table is tightly packed
+  int total = 0;
+  for ( int o = 0; o < out_count; ++o ) {
+    double center = ( o + 0.5 ) * scale;
+    double lo = center - scale * 0.5;
+    double hi = center + scale * 0.5;
+    int i0, i1;
+    if ( kernel == STBIR_DS_TRIANGLE ) {
+      // triangle support is one footprint on each side of the peak
+      lo = center - scale;
+      hi = center + scale;
+    }
+    i0 = (int) floor( lo );
+    i1 = (int) ceil( hi );
+    if ( i0 < 0 ) i0 = 0;
+    if ( i1 > in_count ) i1 = in_count;
+    axis->first[ o ] = i0;
+    axis->count[ o ] = i1 - i0;
+    total += i1 - i0;
+  }
+  axis->total_weights = total;
+  axis->weights = (float *) STBIR_MALLOC( sizeof(float) * (size_t) total, user_data );
+  if ( axis->weights == NULL ) {
+    stbir__ds_free_axis( axis, user_data );
+    return 0;
+  }
+
+  float * wp = axis->weights;
+  for ( int o = 0; o < out_count; ++o ) {
+    double center = ( o + 0.5 ) * scale;
+    double flo = center - scale * 0.5;
+    double fhi = center + scale * 0.5;
+    int i0 = axis->first[ o ];
+    int n  = axis->count[ o ];
+    double wsum = 0;
+    for ( int k = 0; k < n; ++k ) {
+      int i = i0 + k;
+      double a = (double) i;
+      double b = (double) i + 1.0;
+      double w;
+      if ( kernel == STBIR_DS_BOX ) {
+        double ov = ( fhi < b ? fhi : b ) - ( flo > a ? flo : a );
+        w = ov > 0 ? ov : 0;                       // box: plain overlap length
+      } else {
+        // integrate the triangle kernel over the cell intersecting its
+        // full support [center-scale, center+scale] (a genuine tent kernel,
+        // not the box footprint, so it differs from box at integer ratios)
+        double sup_lo = -scale, sup_hi = scale;
+        double pa = a - center, pb = b - center;
+        double lo = pa > sup_lo ? pa : sup_lo;
+        double hi = pb < sup_hi ? pb : sup_hi;
+        w = hi > lo ? stbir__ds_triangle_integral( lo, hi, scale ) : 0;
+      }
+      wsum += w;
+      wp[ k ] = (float) w;
+    }
+    // normalize: keeps energy constant including partially-covered edge pixels
+    if ( wsum > 0 )
+      for ( int k = 0; k < n; ++k )
+        wp[ k ] = (float) ( wp[ k ] / wsum );
+    wp += n;
+  }
+  return 1;
+}
+
+// byte size of the horizontal-pass float intermediate
+STBIRDEF size_t stbir_downsample_scratch_size_bytes( int input_w, int input_h, int output_w, int output_h, int channels )
+{
+  if ( channels < 1 || channels > 4 )
+    return 0;
+  if ( input_w <= 0 || input_h <= 0 || output_w <= 0 || output_h <= 0 )
+    return 0;
+  if ( output_w >= input_w || output_h >= input_h )
+    return 0;
+  // horizontal pass keeps input_h rows of output_w pixels
+  if ( (size_t) output_w * (size_t) channels > ( (size_t) -1 ) / sizeof(float) / (size_t) input_h )
+    return 0;
+  return sizeof(float) * (size_t) input_h * (size_t) output_w * (size_t) channels;
+}
+
+// shared parameter validation for both data-type entry points
+static int stbir__ds_validate( const void * input_pixels, int input_w, int input_h, int input_stride_in_bytes,
+                               const void * output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                               int channels, const stbir_downsample_config * config, size_t pixel_size )
+{
+  if ( input_pixels == NULL )
+    return 0;
+  if ( channels < 1 || channels > 4 )
+    return 0;
+  if ( input_w <= 0 || input_h <= 0 || output_w <= 0 || output_h <= 0 )
+    return 0;
+  if ( output_w >= input_w || output_h >= input_h )  // downsample only
+    return 0;
+  size_t in_row  = (size_t) input_w  * (size_t) channels * pixel_size;
+  size_t out_row = (size_t) output_w * (size_t) channels * pixel_size;
+  if ( input_stride_in_bytes != 0 && (size_t) input_stride_in_bytes < in_row )
+    return 0;
+  if ( output_pixels != NULL && output_stride_in_bytes != 0 && (size_t) output_stride_in_bytes < out_row )
+    return 0;
+  if ( config != NULL ) {
+    if ( config->kernel != STBIR_DS_BOX && config->kernel != STBIR_DS_TRIANGLE )
+      return 0;
+    if ( config->color_mode != STBIR_DS_GAMMA && config->color_mode != STBIR_DS_LINEAR )
+      return 0;
+  }
+  return 1;
+}
+
+static void stbir__ds_resample_u8( const unsigned char * input, int in_stride, unsigned char * output, int out_stride,
+                                   int input_w, int input_h, int output_w, int output_h, int channels,
+                                   const stbir__ds_axis * ax, const stbir__ds_axis * ay, int linear, float * scratch )
+{
+  const int hstride = output_w * channels;
+
+  /* horizontal pass: input rows -> scratch rows */
+  for ( int y = 0; y < input_h; ++y ) {
+    size_t in_off = (size_t) y * ( in_stride ? (size_t) in_stride : (size_t) input_w * channels * sizeof(unsigned char) );
+    const unsigned char * in_row = (const unsigned char *) ( (const char *) input + in_off );
+    float * mid = scratch + (size_t) y * hstride;
+    const float * wbase = ax->weights;
+    for ( int x = 0; x < output_w; ++x ) {
+      int i0 = ax->first[ x ], n = ax->count[ x ];
+      for ( int c = 0; c < channels; ++c ) {
+        float acc = 0;
+        for ( int k = 0; k < n; ++k ) {
+          unsigned char sv = in_row[ ( i0 + k ) * channels + c ];
+          float v = linear ? stbir__srgb_uchar_to_linear_float[ sv ] : (float) sv;
+          acc += wbase[ k ] * v;
+        }
+        mid[ x * channels + c ] = acc;
+      }
+      wbase += n;
+    }
+  }
+
+  /* vertical pass: scratch columns -> output */
+  for ( int y = 0; y < output_h; ++y ) {
+    size_t out_off = (size_t) y * ( out_stride ? (size_t) out_stride : (size_t) output_w * channels * sizeof(unsigned char) );
+    unsigned char * out_row = (unsigned char *) ( (char *) output + out_off );
+    int j0 = ay->first[ y ], m = ay->count[ y ];
+    const float * wbase = ay->weights;
+    for ( int yy = 0; yy < y; ++yy ) wbase += ay->count[ yy ];
+    for ( int x = 0; x < output_w; ++x ) {
+      for ( int c = 0; c < channels; ++c ) {
+        float acc = 0;
+        for ( int k = 0; k < m; ++k ) {
+          const float * mid = scratch + (size_t) ( j0 + k ) * hstride;
+          acc += wbase[ k ] * mid[ x * channels + c ];
+        }
+        if ( linear )
+          out_row[ x * channels + c ] = stbir__linear_to_srgb_uchar( acc );
+        else {
+          if ( acc < 0 ) acc = 0; else if ( acc > 255 ) acc = 255;
+          out_row[ x * channels + c ] = (unsigned char) ( acc + 0.5f );
+        }
+      }
+    }
+  }
+}
+
+static void stbir__ds_resample_f32( const float * input, int in_stride, float * output, int out_stride,
+                                    int input_w, int input_h, int output_w, int output_h, int channels,
+                                    const stbir__ds_axis * ax, const stbir__ds_axis * ay, int linear, float * scratch )
+{
+  const int hstride = output_w * channels;
+
+  /* horizontal pass: input rows -> scratch rows */
+  for ( int y = 0; y < input_h; ++y ) {
+    size_t in_off = (size_t) y * ( in_stride ? (size_t) in_stride : (size_t) input_w * channels * sizeof(float) );
+    const float * in_row = (const float *) ( (const char *) input + in_off );
+    float * mid = scratch + (size_t) y * hstride;
+    const float * wbase = ax->weights;
+    for ( int x = 0; x < output_w; ++x ) {
+      int i0 = ax->first[ x ], n = ax->count[ x ];
+      for ( int c = 0; c < channels; ++c ) {
+        float acc = 0;
+        for ( int k = 0; k < n; ++k ) {
+          float v = in_row[ ( i0 + k ) * channels + c ];
+          if ( linear ) {
+            if ( v < 0 ) v = 0; else if ( v > 1 ) v = 1;
+            v = stbir__ds_srgb_to_linear( v );
+          }
+          acc += wbase[ k ] * v;
+        }
+        mid[ x * channels + c ] = acc;
+      }
+      wbase += n;
+    }
+  }
+
+  /* vertical pass: scratch columns -> output */
+  for ( int y = 0; y < output_h; ++y ) {
+    size_t out_off = (size_t) y * ( out_stride ? (size_t) out_stride : (size_t) output_w * channels * sizeof(float) );
+    float * out_row = (float *) ( (char *) output + out_off );
+    int j0 = ay->first[ y ], m = ay->count[ y ];
+    const float * wbase = ay->weights;
+    for ( int yy = 0; yy < y; ++yy ) wbase += ay->count[ yy ];
+    for ( int x = 0; x < output_w; ++x ) {
+      for ( int c = 0; c < channels; ++c ) {
+        float acc = 0;
+        for ( int k = 0; k < m; ++k ) {
+          const float * mid = scratch + (size_t) ( j0 + k ) * hstride;
+          acc += wbase[ k ] * mid[ x * channels + c ];
+        }
+        if ( linear ) {
+          float g = stbir__ds_linear_to_srgb( acc );
+          if ( g < 0 ) g = 0; else if ( g > 1 ) g = 1;
+          out_row[ x * channels + c ] = g;
+        } else {
+          if ( acc < 0 ) acc = 0; else if ( acc > 1 ) acc = 1;
+          out_row[ x * channels + c ] = acc;
+        }
+      }
+    }
+  }
+}
+
+static unsigned char * stbir__ds_entry_u8( const unsigned char * input_pixels, int input_w, int input_h, int input_stride_in_bytes,
+                                           unsigned char * output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                           int channels, const stbir_downsample_config * user_config )
+{
+  static const stbir_downsample_config default_config = { STBIR_DS_TRIANGLE, STBIR_DS_LINEAR };
+  if ( !stbir__ds_validate( input_pixels, input_w, input_h, input_stride_in_bytes,
+                            output_pixels, output_w, output_h, output_stride_in_bytes, channels, user_config, 1 ) )
+    return NULL;
+  const stbir_downsample_config * config = user_config ? user_config : &default_config;
+  int linear = config->color_mode == STBIR_DS_LINEAR;
+  int allocated = 0;
+  if ( output_pixels == NULL ) {
+    size_t row = (size_t) output_w * (size_t) channels;
+    output_pixels = (unsigned char *) STBIR_MALLOC( row * (size_t) output_h, 0 );
+    if ( output_pixels == NULL ) return NULL;
+    allocated = 1;
+  }
+  stbir__ds_axis ax = { 0, 0, 0, NULL, NULL, NULL, 0 }, ay = { 0, 0, 0, NULL, NULL, NULL, 0 };
+  if ( !stbir__ds_build_axis( &ax, input_w, output_w, config->kernel, 0 ) ||
+       !stbir__ds_build_axis( &ay, input_h, output_h, config->kernel, 0 ) ) {
+    stbir__ds_free_axis( &ax, 0 ); stbir__ds_free_axis( &ay, 0 );
+    if ( allocated ) STBIR_FREE( output_pixels, 0 );
+    return NULL;
+  }
+  size_t scratch_bytes = stbir_downsample_scratch_size_bytes( input_w, input_h, output_w, output_h, channels );
+  float * scratch = (float *) STBIR_MALLOC( scratch_bytes, 0 );
+  if ( scratch == NULL ) {
+    stbir__ds_free_axis( &ax, 0 ); stbir__ds_free_axis( &ay, 0 );
+    if ( allocated ) STBIR_FREE( output_pixels, 0 );
+    return NULL;
+  }
+  stbir__ds_resample_u8( input_pixels, input_stride_in_bytes, output_pixels, output_stride_in_bytes,
+                         input_w, input_h, output_w, output_h, channels, &ax, &ay, linear, scratch );
+  STBIR_FREE( scratch, 0 );
+  stbir__ds_free_axis( &ax, 0 );
+  stbir__ds_free_axis( &ay, 0 );
+  return output_pixels;
+}
+
+static float * stbir__ds_entry_f32( const float * input_pixels, int input_w, int input_h, int input_stride_in_bytes,
+                                    float * output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                    int channels, const stbir_downsample_config * user_config )
+{
+  static const stbir_downsample_config default_config = { STBIR_DS_TRIANGLE, STBIR_DS_LINEAR };
+  if ( !stbir__ds_validate( input_pixels, input_w, input_h, input_stride_in_bytes,
+                            output_pixels, output_w, output_h, output_stride_in_bytes, channels, user_config, sizeof(float) ) )
+    return NULL;
+  const stbir_downsample_config * config = user_config ? user_config : &default_config;
+  int linear = config->color_mode == STBIR_DS_LINEAR;
+  int allocated = 0;
+  if ( output_pixels == NULL ) {
+    size_t row = (size_t) output_w * (size_t) channels * sizeof(float);
+    output_pixels = (float *) STBIR_MALLOC( row * (size_t) output_h, 0 );
+    if ( output_pixels == NULL ) return NULL;
+    allocated = 1;
+  }
+  stbir__ds_axis ax = { 0, 0, 0, NULL, NULL, NULL, 0 }, ay = { 0, 0, 0, NULL, NULL, NULL, 0 };
+  if ( !stbir__ds_build_axis( &ax, input_w, output_w, config->kernel, 0 ) ||
+       !stbir__ds_build_axis( &ay, input_h, output_h, config->kernel, 0 ) ) {
+    stbir__ds_free_axis( &ax, 0 ); stbir__ds_free_axis( &ay, 0 );
+    if ( allocated ) STBIR_FREE( output_pixels, 0 );
+    return NULL;
+  }
+  size_t scratch_bytes = stbir_downsample_scratch_size_bytes( input_w, input_h, output_w, output_h, channels );
+  float * scratch = (float *) STBIR_MALLOC( scratch_bytes, 0 );
+  if ( scratch == NULL ) {
+    stbir__ds_free_axis( &ax, 0 ); stbir__ds_free_axis( &ay, 0 );
+    if ( allocated ) STBIR_FREE( output_pixels, 0 );
+    return NULL;
+  }
+  stbir__ds_resample_f32( input_pixels, input_stride_in_bytes, output_pixels, output_stride_in_bytes,
+                          input_w, input_h, output_w, output_h, channels, &ax, &ay, linear, scratch );
+  STBIR_FREE( scratch, 0 );
+  stbir__ds_free_axis( &ax, 0 );
+  stbir__ds_free_axis( &ay, 0 );
+  return output_pixels;
+}
+
+STBIRDEF unsigned char * stbir_downsample_uint8( const unsigned char * input_pixels, int input_w, int input_h, int input_stride_in_bytes,
+                                                 unsigned char * output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                                 int channels, const stbir_downsample_config * config )
+{
+  return stbir__ds_entry_u8( input_pixels, input_w, input_h, input_stride_in_bytes,
+                             output_pixels, output_w, output_h, output_stride_in_bytes, channels, config );
+}
+
+STBIRDEF float * stbir_downsample_float( const float * input_pixels, int input_w, int input_h, int input_stride_in_bytes,
+                                         float * output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                         int channels, const stbir_downsample_config * config )
+{
+  return stbir__ds_entry_f32( input_pixels, input_w, input_h, input_stride_in_bytes,
+                              output_pixels, output_w, output_h, output_stride_in_bytes, channels, config );
+}
+
+#undef STBIR_BGR
 #undef STBIR_BGR
 #undef STBIR_1CHANNEL
 #undef STBIR_2CHANNEL
