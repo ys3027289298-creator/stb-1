@@ -1,4 +1,4 @@
-/* stb_image_resize - v0.97 - public domain image resizing
+/* stb_image_resize - v0.98 - public domain image resizing
    by Jorge L Rodriguez (@VinoBS) - 2014
    http://github.com/nothings/stb
 
@@ -62,6 +62,35 @@
             #define STBIR_DEFAULT_FILTER_DOWNSAMPLE   STBIR_FILTER_something
 
          See stbir_filter in the header-file section for the list of filters.
+
+      FAST PATHS
+         Small-image scaling (e.g. startup assets) is handled by one of
+         two fast paths when applicable, before the general resampler:
+           1. integer-scale nearest neighbor via index expansion
+              (uint8, full-frame transform, output size an exact integer
+              multiple of the input size in both axes)
+           2. a dedicated branch for 1-channel uint8 inputs (grayscale
+              or palette-index maps) at any scale, up or down
+         Everything else falls back to the general resampler, whose
+         output is pixel-identical to previous versions. The fast paths
+         perform no memory allocation and write directly into the
+         caller's output buffer. Nearest-neighbor sampling is a
+         deliberate quality/speed trade-off for small images; for
+         palette-index maps interpolation would invent invalid indices,
+         so nearest is the only correct semantics there.
+         Each of the three segments can be compiled out for comparison:
+           #define STBIR_NO_FAST_PATH_INT_NN   // disable fast path 1
+           #define STBIR_NO_FAST_PATH_GRAY     // disable fast path 2
+           #define STBIR_NO_GENERAL_FALLBACK   // disable the fallback
+                                               // (calls that would fall
+                                               //  back return 0)
+           #define STBIR_NO_FAST_PATHS         // disable 1+2 at once
+                                               // (original behavior)
+         Define STBIR_FAST_PATH_STATS to get the global hit counters
+         stbir__stat_int_nn_hits, stbir__stat_gray_hits and
+         stbir__stat_fallback_hits.
+         Zero or negative scale (any input/output dimension <= 0) is
+         rejected explicitly: the resize functions return 0.
 
       NEW FILTERS
          A number of 1D filter kernels are used. For a list of
@@ -159,6 +188,13 @@
       Nathan Reed: warning fixes
 
    REVISIONS
+      0.98 (2026-11-18) fast paths for small-image scaling (see "FAST
+                          PATHS" above): integer-scale nearest neighbor
+                          via index expansion, dedicated 1-channel
+                          (grayscale/palette) branch, general resampler
+                          kept pixel-identical as fallback; resize
+                          functions now explicitly fail (return 0) on
+                          zero/negative dimensions
       0.97 (2020-02-02) fixed warning
       0.96 (2019-03-04) fixed warnings
       0.95 (2017-07-23) fixed warnings
@@ -374,6 +410,14 @@ STBIRDEF int stbir_resize_region(  const void *input_pixels , int input_w , int 
                                    stbir_colorspace space, void *alloc_context,
                                    float s0, float t0, float s1, float t1);
 // (s0, t0) & (s1, t1) are the top-left and bottom right corner (uv addressing style: [0, 1]x[0, 1]) of a region of the input image to use.
+
+// Fast-path hit counters, defined only when STBIR_FAST_PATH_STATS is set
+// (see "FAST PATHS" in the documentation at the top of this file).
+#ifdef STBIR_FAST_PATH_STATS
+extern int stbir__stat_int_nn_hits;   // integer-scale nearest-neighbor fast path
+extern int stbir__stat_gray_hits;     // 1-channel (grayscale/palette) fast path
+extern int stbir__stat_fallback_hits; // general resampler fallback
+#endif
 
 //
 //
@@ -2425,6 +2469,128 @@ static int stbir__resize_allocated(stbir__info *info,
 }
 
 
+//////////////////////////////////////////////////////////////////////////////
+//
+// Fast paths for small-image scaling (e.g. startup assets). See "FAST
+// PATHS" in the documentation at the top of this file. None of the fast
+// paths allocate memory; anything they don't cover falls through to the
+// general resampler, which is unchanged.
+
+#ifdef STBIR_FAST_PATH_STATS
+int stbir__stat_int_nn_hits = 0;
+int stbir__stat_gray_hits = 0;
+int stbir__stat_fallback_hits = 0;
+#define STBIR__STAT_INC(c) (++c)
+#else
+#define STBIR__STAT_INC(c) ((void)0)
+#endif
+
+#if !defined(STBIR_NO_FAST_PATHS) && !defined(STBIR_NO_FAST_PATH_INT_NN)
+#define STBIR__ENABLE_FAST_PATH_INT_NN
+#endif
+
+#if !defined(STBIR_NO_FAST_PATHS) && !defined(STBIR_NO_FAST_PATH_GRAY)
+#define STBIR__ENABLE_FAST_PATH_GRAY
+#endif
+
+#ifdef STBIR__ENABLE_FAST_PATH_INT_NN
+// Integer upscale by (kx, ky), kx,ky >= 1: expand each source pixel into a
+// kx-by-ky block of destination pixels ("index expansion"). Writes directly
+// into the caller's output buffer; no allocations.
+static void stbir__fast_path_int_nn(const unsigned char* input, int input_w, int input_h, int input_stride,
+                                    unsigned char* output, int output_w, int output_stride,
+                                    int kx, int ky, int channels)
+{
+    int x, y, k;
+    size_t row_bytes = (size_t)output_w * channels;
+
+    for (y = 0; y < input_h; y++)
+    {
+        const unsigned char* src_row = input + (size_t)y * input_stride;
+        unsigned char* dst_row = output + (size_t)(y * ky) * output_stride;
+        unsigned char* d = dst_row;
+
+        // expand one source row into the first destination row of the block
+        if (channels == 1)
+        {
+            for (x = 0; x < input_w; x++)
+            {
+                unsigned char v = src_row[x];
+                for (k = 0; k < kx; k++)
+                    *d++ = v;
+            }
+        }
+        else if (channels == 2)
+        {
+            for (x = 0; x < input_w; x++, src_row += 2)
+                for (k = 0; k < kx; k++, d += 2)
+                {
+                    d[0] = src_row[0];
+                    d[1] = src_row[1];
+                }
+        }
+        else if (channels == 4)
+        {
+            for (x = 0; x < input_w; x++, src_row += 4)
+                for (k = 0; k < kx; k++, d += 4)
+                    memcpy(d, src_row, 4);
+        }
+        else
+        {
+            int c;
+            for (x = 0; x < input_w; x++, src_row += channels)
+                for (k = 0; k < kx; k++, d += channels)
+                    for (c = 0; c < channels; c++)
+                        d[c] = src_row[c];
+        }
+
+        // replicate the expanded row into the remaining ky-1 rows of the block
+        for (k = 1; k < ky; k++)
+            memcpy(dst_row + (size_t)k * output_stride, dst_row, row_bytes);
+    }
+}
+#endif // STBIR__ENABLE_FAST_PATH_INT_NN
+
+#ifdef STBIR__ENABLE_FAST_PATH_GRAY
+// 1-channel uint8 (grayscale or palette-index map) at any scale, up or
+// down: nearest-neighbor gather with exact Bresenham-style index stepping
+// (sx = x*input_w/output_w, sy = y*input_h/output_h) -- no division and no
+// allocations. Nearest is required for palette indices (interpolating them
+// would invent invalid indices) and is the deliberate fast trade-off for
+// grayscale startup assets.
+static void stbir__fast_path_gray(const unsigned char* input, int input_w, int input_h, int input_stride,
+                                  unsigned char* output, int output_w, int output_h, int output_stride)
+{
+    int x, y;
+    int sy = 0, yerr = 0;
+
+    for (y = 0; y < output_h; y++)
+    {
+        const unsigned char* src_row = input + (size_t)sy * input_stride;
+        unsigned char* dst_row = output + (size_t)y * output_stride;
+        int sx = 0, xerr = 0;
+
+        for (x = 0; x < output_w; x++)
+        {
+            dst_row[x] = src_row[sx];
+            xerr += input_w;
+            while (xerr >= output_w)
+            {
+                sx++;
+                xerr -= output_w;
+            }
+        }
+
+        yerr += input_h;
+        while (yerr >= output_h)
+        {
+            sy++;
+            yerr -= output_h;
+        }
+    }
+}
+#endif // STBIR__ENABLE_FAST_PATH_GRAY
+
 static int stbir__resize_arbitrary(
     void *alloc_context,
     const void* input_data, int input_w, int input_h, int input_stride_in_bytes,
@@ -2434,10 +2600,69 @@ static int stbir__resize_arbitrary(
     stbir_filter h_filter, stbir_filter v_filter,
     stbir_edge edge_horizontal, stbir_edge edge_vertical, stbir_colorspace colorspace)
 {
+#ifndef STBIR_NO_GENERAL_FALLBACK
     stbir__info info;
     int result;
     size_t memory_required;
     void* extra_memory;
+#endif
+
+    // Explicit handling of degenerate scales (zero or negative dimensions):
+    // fail cleanly instead of dividing by zero or walking bad pointers.
+    STBIR_ASSERT(input_w > 0 && input_h > 0 && output_w > 0 && output_h > 0);
+    if (input_w <= 0 || input_h <= 0 || output_w <= 0 || output_h <= 0)
+        return 0;
+
+    STBIR_ASSERT(input_data != NULL && output_data != NULL);
+    if (input_data == NULL || output_data == NULL)
+        return 0;
+
+#if defined(STBIR__ENABLE_FAST_PATH_INT_NN) || defined(STBIR__ENABLE_FAST_PATH_GRAY)
+    // Fast paths apply to full-frame 8-bit transforms only; everything else
+    // falls through to the general resampler below.
+    if (type == STBIR_TYPE_UINT8 && transform == NULL && channels >= 1 &&
+        s0 == 0 && t0 == 0 && s1 == 1 && t1 == 1)
+    {
+#ifdef STBIR__ENABLE_FAST_PATH_INT_NN
+        if (output_w >= input_w && output_h >= input_h &&
+            output_w % input_w == 0 && output_h % input_h == 0)
+        {
+            int in_stride  = input_stride_in_bytes  ? input_stride_in_bytes  : input_w  * channels;
+            int out_stride = output_stride_in_bytes ? output_stride_in_bytes : output_w * channels;
+            stbir__fast_path_int_nn((const unsigned char*)input_data, input_w, input_h, in_stride,
+                                    (unsigned char*)output_data, output_w, out_stride,
+                                    output_w / input_w, output_h / input_h, channels);
+            STBIR__STAT_INC(stbir__stat_int_nn_hits);
+            return 1;
+        }
+#endif
+#ifdef STBIR__ENABLE_FAST_PATH_GRAY
+        if (channels == 1)
+        {
+            int in_stride  = input_stride_in_bytes  ? input_stride_in_bytes  : input_w;
+            int out_stride = output_stride_in_bytes ? output_stride_in_bytes : output_w;
+            stbir__fast_path_gray((const unsigned char*)input_data, input_w, input_h, in_stride,
+                                  (unsigned char*)output_data, output_w, output_h, out_stride);
+            STBIR__STAT_INC(stbir__stat_gray_hits);
+            return 1;
+        }
+#endif
+    }
+#endif
+
+#ifdef STBIR_NO_GENERAL_FALLBACK
+    // Fallback compiled out: only the fast paths above may produce output.
+    STBIR__NOTUSED(alloc_context);
+    STBIR__NOTUSED(alpha_channel);
+    STBIR__NOTUSED(flags);
+    STBIR__NOTUSED(h_filter);
+    STBIR__NOTUSED(v_filter);
+    STBIR__NOTUSED(edge_horizontal);
+    STBIR__NOTUSED(edge_vertical);
+    STBIR__NOTUSED(colorspace);
+    return 0;
+#else
+    STBIR__STAT_INC(stbir__stat_fallback_hits);
 
     stbir__setup(&info, input_w, input_h, output_w, output_h, channels);
     stbir__calculate_transform(&info, s0,t0,s1,t1,transform);
@@ -2457,6 +2682,7 @@ static int stbir__resize_arbitrary(
     STBIR_FREE(extra_memory, alloc_context);
 
     return result;
+#endif // STBIR_NO_GENERAL_FALLBACK
 }
 
 STBIRDEF int stbir_resize_uint8(     const unsigned char *input_pixels , int input_w , int input_h , int input_stride_in_bytes,
