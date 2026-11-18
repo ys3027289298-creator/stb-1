@@ -129,6 +129,36 @@ USAGE:
    Higher quality looks better but results in a bigger image.
    JPEG baseline (no JPEG progressive).
 
+STEGANOGRAPHY:
+
+   This library also provides optional helpers for hiding a small payload in
+   the least-significant bits of 8-bit pixel data. They work on in-memory
+   pixels only; they do not touch files and the image writers above never
+   call them, so writer output is unchanged when the feature is unused.
+
+     void stbi_write_steg_default_config(stbi_steg_config *config);
+     int  stbi_write_steg_capacity(int w, int h, int comp, const stbi_steg_config *config);
+     int  stbi_write_steg_embed(unsigned char *pixels, int w, int h, int comp, ptrdiff_t stride_in_bytes, const stbi_steg_config *config, const void *data, int data_len);
+     int  stbi_write_steg_extract(const unsigned char *pixels, int w, int h, int comp, ptrdiff_t stride_in_bytes, const stbi_steg_config *config, void *data, int data_cap, int *data_len);
+
+   The configuration selects which channels carry data (channel_mask, bit 0
+   is the first channel), how many low bits per channel are used (bit_depth,
+   1-8), how many pixels to skip between used pixels (pixel_stride), and
+   whether the slots are visited in a keyed pseudo-random order (randomize
+   plus seed). 'randomize' is not encryption: it only spreads the payload out
+   so it isn't a contiguous run of LSB changes, and extraction must use the
+   same seed.
+
+   Embedded data gets a 12-byte header (magic, 4-byte little-endian payload
+   length, 4-byte CRC32 over length+payload), so extraction verifies
+   integrity. embed returns 0 and modifies nothing if the payload does not
+   fit; it never silently truncates. extract returns 0 on a bad header, a
+   checksum mismatch, or if data_cap is smaller than the embedded length.
+   Embedding is lossless only for lossless formats: writing the result as
+   PNG and reading it back preserves the payload, but JPEG compression will
+   destroy it.
+
+
 CREDITS:
 
 
@@ -225,6 +255,49 @@ STBIWDEF int stbi_write_hdr_strided_to_func(stbi_write_func *func, void *context
 STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
 
 STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// steganography: LSB embedding/extraction in 8-bit-per-channel pixel data
+//
+// The functions below operate on in-memory pixel data only. They do not read
+// or write files, and they are completely independent of the image writers
+// above: the stbi_write_* functions never call into this code, so their output
+// is bit-for-bit unchanged whether or not it is used.
+//
+// Payload bits are stored in the low 'bit_depth' bits of the selected channels
+// of every 'pixel_stride'-th pixel. A 12-byte header (4-byte magic, 4-byte
+// little-endian payload length, 4-byte CRC32 over the length + payload) is
+// embedded first, and extraction fails if the header or checksum doesn't match.
+// If 'randomize' is set, the slots are visited in a deterministic pseudo-random
+// order derived from 'seed' (the same seed must be used to extract).
+//
+// stbi_write_steg_embed() fails (returns 0) without touching the pixels if the
+// payload plus header does not fit; it never truncates the payload.
+
+typedef struct
+{
+   int channel_mask;  // bitmask of channels to use; bit 0 = first channel. Bits past
+                      // the image's component count are ignored (default 0xf = all).
+   int bit_depth;     // 1-8 bits stored in each used channel slot
+   int pixel_stride;  // use every pixel_stride-th pixel (1 = every pixel)
+   int randomize;     // 0 = sequential slot order, nonzero = keyed scatter order
+   unsigned int seed; // key for the scatter order (ignored when randomize is 0)
+} stbi_steg_config;
+
+// fills in a default configuration: all channels, 1 bit deep, every pixel, sequential
+STBIWDEF void stbi_write_steg_default_config(stbi_steg_config *config);
+
+// maximum payload bytes that fit with this configuration (header excluded),
+// or -1 if the configuration/dimensions are invalid
+STBIWDEF int stbi_write_steg_capacity(int w, int h, int comp, const stbi_steg_config *config);
+
+// returns 1 on success, 0 on failure (invalid arguments, or capacity too small)
+STBIWDEF int stbi_write_steg_embed(unsigned char *pixels, int w, int h, int comp, ptrdiff_t stride_in_bytes, const stbi_steg_config *config, const void *data, int data_len);
+
+// returns 1 on success, 0 on failure (invalid header, checksum mismatch,
+// capacity too small, or 'data_cap' too small for the embedded length)
+STBIWDEF int stbi_write_steg_extract(const unsigned char *pixels, int w, int h, int comp, ptrdiff_t stride_in_bytes, const stbi_steg_config *config, void *data, int data_cap, int *data_len);
 
 #endif//INCLUDE_STB_IMAGE_WRITE_H
 
@@ -1824,6 +1897,306 @@ STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const 
    return stbi_write_jpg_strided(filename, x, y, comp, data, 0, quality);
 }
 #endif
+
+
+/* ***************************************************************************
+ *
+ * Steganography: LSB embedding/extraction in 8-bit-per-channel pixel data
+ *
+ * Completely self-contained: nothing above calls into this code, so the
+ * regular stbi_write_* functions are unaffected.
+ */
+
+#define STBIW__STEG_MAGIC0 0x53 /* 'S' */
+#define STBIW__STEG_MAGIC1 0x54 /* 'T' */
+#define STBIW__STEG_MAGIC2 0x45 /* 'E' */
+#define STBIW__STEG_MAGIC3 0x47 /* 'G' */
+#define STBIW__STEG_HEADER 12
+
+static unsigned int stbiw__steg_mix(unsigned int x)
+{
+   x ^= x >> 16;
+   x *= 0x7feb352dU;
+   x ^= x >> 15;
+   x *= 0x846ca68bU;
+   x ^= x >> 16;
+   return x;
+}
+
+// Bijection on [0,2^(2*hbits)): a 4-round Feistel network with hbits per half.
+static unsigned int stbiw__steg_perm_raw(unsigned int i, unsigned int seed, int hbits)
+{
+   unsigned int mask = (1u << hbits) - 1u;
+   unsigned int l = i & mask;
+   unsigned int r = (i >> hbits) & mask;
+   int round;
+
+   for (round = 0; round < 4; ++round) {
+      unsigned int f = stbiw__steg_mix(r ^ seed ^ (0x9e3779b9U * (unsigned int)(round + 1))) & mask;
+      unsigned int nl = r;
+      unsigned int nr = (l ^ f) & mask;
+      l = nl;
+      r = nr;
+   }
+   return (l & mask) | (r << hbits);
+}
+
+// Bijection on [0,n) via a Feistel permutation on the smallest even-bit domain
+// >= n, followed by cycle walking. Used to visit the embedding slots in a keyed
+// pseudo-random order without allocating a permutation table.
+static unsigned int stbiw__steg_perm(unsigned int i, unsigned int n, unsigned int seed)
+{
+   int hbits = 1;
+   unsigned int v;
+
+   if (n <= 1) return 0;
+   while (hbits < 16 && (1u << (2 * hbits)) < n)
+      ++hbits;
+
+   v = stbiw__steg_perm_raw(i, seed, hbits);
+   while (v >= n) v = stbiw__steg_perm_raw(v, seed, hbits);
+   return v;
+}
+
+static int stbiw__steg_channels(int comp, int mask, int *channels)
+{
+   int i, n = 0;
+   for (i = 0; i < comp; ++i)
+      if (mask & (1 << i))
+         channels[n++] = i;
+   return n;
+}
+
+// returns the number of usable slots, or 0 for an invalid configuration
+static size_t stbiw__steg_slots(int w, int h, int comp, ptrdiff_t stride_in_bytes,
+                                const stbi_steg_config *config, int *nchannels_out)
+{
+   int channels[32];
+   int nchannels;
+   size_t total_pixels, used_pixels, stride_px;
+
+   if (!config || w <= 0 || h <= 0 || comp <= 0 || comp > 32)
+      return 0;
+   if (config->bit_depth < 1 || config->bit_depth > 8)
+      return 0;
+   if (config->pixel_stride < 1)
+      return 0;
+   if ((unsigned int)config->channel_mask == 0)
+      return 0;
+   if (stride_in_bytes != 0 && stride_in_bytes < (ptrdiff_t)w * comp)
+      return 0;
+
+   nchannels = stbiw__steg_channels(comp, config->channel_mask, channels);
+   if (nchannels <= 0)
+      return 0;
+
+   stride_px = (size_t)config->pixel_stride;
+   total_pixels = (size_t)w * (size_t)h;
+   used_pixels = (total_pixels + stride_px - 1) / stride_px;
+
+   // all of these are bounded by the int-sized dimensions, but the product can
+   // still exceed INT_MAX; cap it so the unsigned 32-bit slot index stays valid
+   if (used_pixels > (size_t)2147483647 / (size_t)nchannels / (size_t)config->bit_depth)
+      return 0;
+
+   if (nchannels_out) *nchannels_out = nchannels;
+   return used_pixels * (size_t)nchannels * (size_t)config->bit_depth;
+}
+
+static void stbiw__steg_slot(unsigned int s, int w, int comp, ptrdiff_t stride_in_bytes,
+                             int pixel_stride, int nchannels, int bit_depth, const int *channels,
+                             size_t *byte_offset, int *bit_pos)
+{
+   unsigned int per_pixel = (unsigned int)(nchannels * bit_depth);
+   unsigned int used_pixel = s / per_pixel;
+   unsigned int rem = s % per_pixel;
+   unsigned int ch = rem / (unsigned int)bit_depth;
+   unsigned int bit = rem % (unsigned int)bit_depth;
+   size_t px = (size_t)used_pixel * (size_t)pixel_stride;
+   size_t row = px / (size_t)w;
+   size_t col = px % (size_t)w;
+
+   *byte_offset = row * (size_t)(stride_in_bytes ? stride_in_bytes : (ptrdiff_t)w * comp)
+                + col * (size_t)comp + (size_t)channels[ch];
+   *bit_pos = (int)bit;
+}
+
+static unsigned int stbiw__steg_crc(const unsigned char *lens, const unsigned char *data, int len)
+{
+   unsigned int crc = 0xffffffffU;
+   int i, k;
+
+   for (i = 0; i < 4; ++i) {
+      crc ^= lens[i];
+      for (k = 0; k < 8; ++k)
+         crc = (crc >> 1) ^ (0xedb88320U & (unsigned int)(-(int)(crc & 1U)));
+   }
+   for (i = 0; i < len; ++i) {
+      crc ^= data[i];
+      for (k = 0; k < 8; ++k)
+         crc = (crc >> 1) ^ (0xedb88320U & (unsigned int)(-(int)(crc & 1U)));
+   }
+   return ~crc;
+}
+
+static unsigned char stbiw__steg_getbit(unsigned char byte, int i)
+{
+   return (unsigned char)((byte >> (7 - i)) & 1);
+}
+
+STBIWDEF void stbi_write_steg_default_config(stbi_steg_config *config)
+{
+   if (!config) return;
+   config->channel_mask = 0xf; // all channels (only bits valid for the image are used)
+   config->bit_depth = 1;
+   config->pixel_stride = 1;
+   config->randomize = 0;
+   config->seed = 0;
+}
+
+STBIWDEF int stbi_write_steg_capacity(int w, int h, int comp, const stbi_steg_config *config)
+{
+   size_t slots = stbiw__steg_slots(w, h, comp, 0, config, NULL);
+   if (slots < (size_t)STBIW__STEG_HEADER * 8)
+      return -1;
+   return (int)((slots - (size_t)STBIW__STEG_HEADER * 8) / 8);
+}
+
+STBIWDEF int stbi_write_steg_embed(unsigned char *pixels, int w, int h, int comp, ptrdiff_t stride_in_bytes,
+                                   const stbi_steg_config *config, const void *data, int data_len)
+{
+   const unsigned char *payload = (const unsigned char *)data;
+   unsigned char header[STBIW__STEG_HEADER];
+   unsigned char lenbytes[4];
+   unsigned int crc;
+   unsigned int i;
+   size_t slots, needed_bits;
+   int channels[32], nchannels, bit_depth;
+
+   slots = stbiw__steg_slots(w, h, comp, stride_in_bytes, config, &nchannels);
+   if (!pixels || !config || data_len < 0 || (data_len > 0 && !payload) || slots == 0)
+      return 0;
+
+   bit_depth = config->bit_depth;
+   if (!stbiw__steg_channels(comp, config->channel_mask, channels))
+      return 0;
+
+   // check against the capacity with divisions so the result cannot overflow
+   // size_t on 32-bit targets for a very large caller-supplied length
+   if (slots < (size_t)STBIW__STEG_HEADER * 8 ||
+       (size_t)data_len > (slots - (size_t)STBIW__STEG_HEADER * 8) / 8)
+      return 0; // capacity too small: fail without modifying anything
+   needed_bits = (size_t)data_len * 8 + (size_t)STBIW__STEG_HEADER * 8;
+
+   lenbytes[0] = (unsigned char)((unsigned int)data_len & 0xff);
+   lenbytes[1] = (unsigned char)(((unsigned int)data_len >> 8) & 0xff);
+   lenbytes[2] = (unsigned char)(((unsigned int)data_len >> 16) & 0xff);
+   lenbytes[3] = (unsigned char)(((unsigned int)data_len >> 24) & 0xff);
+   crc = stbiw__steg_crc(lenbytes, payload, data_len);
+
+   header[0] = STBIW__STEG_MAGIC0;
+   header[1] = STBIW__STEG_MAGIC1;
+   header[2] = STBIW__STEG_MAGIC2;
+   header[3] = STBIW__STEG_MAGIC3;
+   header[4] = lenbytes[0];
+   header[5] = lenbytes[1];
+   header[6] = lenbytes[2];
+   header[7] = lenbytes[3];
+   header[8] = (unsigned char)(crc & 0xff);
+   header[9] = (unsigned char)((crc >> 8) & 0xff);
+   header[10] = (unsigned char)((crc >> 16) & 0xff);
+   header[11] = (unsigned char)((crc >> 24) & 0xff);
+
+   for (i = 0; i < (unsigned int)needed_bits; ++i) {
+      unsigned char byte;
+      unsigned int s;
+      size_t off;
+      int bit_pos;
+
+      if (i < (unsigned int)STBIW__STEG_HEADER * 8)
+         byte = header[i >> 3];
+      else
+         byte = payload[(i - (unsigned int)STBIW__STEG_HEADER * 8) >> 3];
+
+      s = config->randomize ? stbiw__steg_perm(i, (unsigned int)slots, config->seed) : i;
+      stbiw__steg_slot(s, w, comp, stride_in_bytes, config->pixel_stride, nchannels, bit_depth, channels, &off, &bit_pos);
+
+      pixels[off] = (unsigned char)((pixels[off] & ~(1 << bit_pos)) |
+                                    ((int)stbiw__steg_getbit(byte, (int)(i & 7)) << bit_pos));
+   }
+   return 1;
+}
+
+STBIWDEF int stbi_write_steg_extract(const unsigned char *pixels, int w, int h, int comp, ptrdiff_t stride_in_bytes,
+                                     const stbi_steg_config *config, void *data, int data_cap, int *data_len)
+{
+   unsigned char *out = (unsigned char *)data;
+   unsigned char header[STBIW__STEG_HEADER];
+   unsigned char lenbytes[4];
+   unsigned int crc, expect;
+   unsigned int i;
+   size_t slots, needed_bits;
+   int channels[32], nchannels, bit_depth, len;
+
+   if (data_len) *data_len = 0;
+   slots = stbiw__steg_slots(w, h, comp, stride_in_bytes, config, &nchannels);
+   if (!pixels || !config || slots == 0)
+      return 0;
+
+   memset(header, 0, sizeof(header));
+   bit_depth = config->bit_depth;
+   if (!stbiw__steg_channels(comp, config->channel_mask, channels))
+      return 0;
+   if (slots < (size_t)STBIW__STEG_HEADER * 8)
+      return 0;
+
+   for (i = 0; i < (unsigned int)STBIW__STEG_HEADER * 8; ++i) {
+      unsigned int s;
+      size_t off;
+      int bit_pos;
+      s = config->randomize ? stbiw__steg_perm(i, (unsigned int)slots, config->seed) : i;
+      stbiw__steg_slot(s, w, comp, stride_in_bytes, config->pixel_stride, nchannels, bit_depth, channels, &off, &bit_pos);
+      header[i >> 3] = (unsigned char)((header[i >> 3] << 1) | ((pixels[off] >> bit_pos) & 1));
+   }
+
+   if (header[0] != STBIW__STEG_MAGIC0 || header[1] != STBIW__STEG_MAGIC1 ||
+       header[2] != STBIW__STEG_MAGIC2 || header[3] != STBIW__STEG_MAGIC3)
+      return 0;
+
+   lenbytes[0] = header[4];
+   lenbytes[1] = header[5];
+   lenbytes[2] = header[6];
+   lenbytes[3] = header[7];
+   len = (int)((unsigned int)lenbytes[0] | ((unsigned int)lenbytes[1] << 8) |
+               ((unsigned int)lenbytes[2] << 16) | ((unsigned int)lenbytes[3] << 24));
+   if (len < 0 || data_cap < len || (len > 0 && !out))
+      return 0;
+
+   needed_bits = (size_t)len * 8 + (size_t)STBIW__STEG_HEADER * 8;
+   if (needed_bits > slots)
+      return 0;
+
+   for (i = 0; i < (unsigned int)len * 8; ++i) {
+      unsigned int s;
+      size_t off;
+      int bit_pos;
+      s = config->randomize ? stbiw__steg_perm(i + STBIW__STEG_HEADER * 8, (unsigned int)slots, config->seed)
+                            : i + STBIW__STEG_HEADER * 8;
+      stbiw__steg_slot(s, w, comp, stride_in_bytes, config->pixel_stride, nchannels, bit_depth, channels, &off, &bit_pos);
+      out[i >> 3] = (unsigned char)((out[i >> 3] << 1) | ((pixels[off] >> bit_pos) & 1));
+   }
+
+   crc = stbiw__steg_crc(lenbytes, out, len);
+   expect = (unsigned int)header[8] | ((unsigned int)header[9] << 8) |
+            ((unsigned int)header[10] << 16) | ((unsigned int)header[11] << 24);
+   if (crc != expect) {
+      if (len > 0) memset(out, 0, (size_t)len);
+      return 0;
+   }
+
+   if (data_len) *data_len = len;
+   return 1;
+}
 
 #endif // STB_IMAGE_WRITE_IMPLEMENTATION
 
